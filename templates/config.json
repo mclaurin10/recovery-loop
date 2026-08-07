@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "goalFile": "RECOVERY_GOAL.md",
+  "branch": "recovery-loop/work",
+  "prepare": null,
+  "checks": {
+    "smoke": [
+      {
+        "id": "typecheck",
+        "argv": ["pnpm", "typecheck"],
+        "timeoutSeconds": 300
+      }
+    ],
+    "deep": [
+      {
+        "id": "full-test",
+        "argv": ["pnpm", "test"],
+        "timeoutSeconds": 1800,
+        "bisectable": true
+      }
+    ]
+  },
+  "deepPolicy": {
+    "everyCheckpoints": 5,
+    "maxMinutes": 30,
+    "changedFileThreshold": 20,
+    "changedLineThreshold": 1000,
+    "triggerPaths": ["package.json", "pnpm-lock.yaml"],
+    "beforeGoalComplete": true,
+    "afterRecovery": true
+  },
+  "limits": {
+    "maxAgentTurns": 50,
+    "maxWallMinutes": 360,
+    "maxRepairTurnsPerFailure": 2,
+    "maxRecoveryCyclesPerSignature": 3,
+    "maxLocalizationCommits": 64,
+    "agentTurnSeconds": 3600
+  },
+  "protectedPaths": ["RECOVERY_GOAL.md", ".recovery-loop/config.json"],
+  "agent": {
+    "model": "CONFIGURE_AT_INITIALIZATION",
+    "reasoningEffort": "high",
+    "networkAccess": false
+  }
+}

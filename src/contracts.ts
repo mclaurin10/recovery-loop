@@ -284,6 +284,8 @@ export type EventType =
   | "guard-rejected"
   | "check-started"
   | "check-completed"
+  | "failure-observed"
+  | "known-good-advanced"
   | "rescue-ref-created"
   | "revert-created"
   | "revert-failed"

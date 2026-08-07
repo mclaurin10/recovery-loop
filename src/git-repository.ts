@@ -333,6 +333,18 @@ export class GitRepository {
     return { files: paths.size, additions, deletions, binaryFiles };
   }
 
+  async changedPathsBetween(base: string, target: string): Promise<string[]> {
+    const result = await this.git(["diff", "--name-only", "--no-renames", "-z", base, target]);
+    return [...new Set(result.stdout.split("\0").filter((entry) => entry.length > 0))].sort();
+  }
+
+  async firstParent(commit: string): Promise<string | null> {
+    const result = await this.git(["rev-parse", "--verify", `${commit}^1`], {
+      allowFailure: true,
+    });
+    return result.exitCode === 0 ? trimLine(result.stdout) : null;
+  }
+
   async unsafeModeChanges(base = "HEAD"): Promise<UnsafeModeChange[]> {
     const unsafe: UnsafeModeChange[] = [];
     for (const change of await this.changedPaths(true)) {

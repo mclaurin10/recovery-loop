@@ -27,6 +27,10 @@ export interface CommandRunnerHooks {
   afterSpawn?: (pid: number | null) => void | Promise<void>;
 }
 
+export interface CommandSetHooks {
+  afterCommand?: (result: CommandResult, index: number) => void | Promise<void>;
+}
+
 export interface RunCommandOptions {
   repository: GitRepository;
   command: CommandSpec;
@@ -331,6 +335,7 @@ export async function runJournaledCommandSet(options: {
   sequenceStart: number;
   environment?: NodeJS.ProcessEnv;
   stopOnFailure?: boolean;
+  hooks?: CommandSetHooks;
 }): Promise<CommandResult[]> {
   const state = await options.store.readState();
   if (state.repository.expectedHead !== options.commit) {
@@ -391,6 +396,7 @@ export async function runJournaledCommandSet(options: {
         durationMs: result.durationMs,
       },
     });
+    await options.hooks?.afterCommand?.(result, index);
     if ((options.stopOnFailure ?? true) && result.classification !== "pass") break;
   }
   const elapsed = results.reduce((total, result) => total + result.durationMs, 0);

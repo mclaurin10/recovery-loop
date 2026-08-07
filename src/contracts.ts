@@ -181,7 +181,7 @@ export const PHASES = [
 ] as const;
 export type Phase = (typeof PHASES)[number];
 
-export const OPERATION_KINDS = ["workspace", "checkpoint", "revert", "reset", "check"] as const;
+export const OPERATION_KINDS = ["workspace", "checkpoint", "revert", "reset", "check", "agent"] as const;
 export type OperationKind = (typeof OPERATION_KINDS)[number];
 
 export const CHECKPOINT_KINDS = ["work", "repair", "interrupted", "revert"] as const;
@@ -280,6 +280,10 @@ export interface RecoveryState {
 export type EventType =
   | "session-started"
   | "startup-reconciled"
+  | "agent-started"
+  | "agent-completed"
+  | "agent-failed"
+  | "thread-rotated"
   | "checkpoint-created"
   | "guard-rejected"
   | "check-started"

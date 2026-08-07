@@ -21,7 +21,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:acceptance": "vitest run tests/integration tests/unit"
+    "test:acceptance": "vitest run tests/integration tests/unit",
+    "test:agent-live": "vitest run --config vitest.live.config.ts"
   },
   "devDependencies": {
     "@eslint/js": "9.32.0",
@@ -30,5 +31,8 @@
     "typescript": "5.9.2",
     "typescript-eslint": "8.39.0",
     "vitest": "3.2.4"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "0.147.0"
   }
 }

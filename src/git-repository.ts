@@ -3,24 +3,20 @@ import { access, lstat, mkdir, readFile, realpath, stat } from "node:fs/promises
 import path from "node:path";
 import { constants as fsConstants } from "node:fs";
 import type { CheckpointKind } from "./contracts.js";
-
 interface GitResult {
   stdout: string;
   stderr: string;
   exitCode: number;
 }
-
 interface RunGitOptions {
   input?: string;
   environment?: NodeJS.ProcessEnv;
   allowFailure?: boolean;
 }
-
 export class GitCommandError extends Error {
   readonly args: readonly string[];
   readonly exitCode: number;
   readonly stderr: string;
-
   constructor(args: readonly string[], result: GitResult) {
     const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`;
     super(`git ${args.join(" ")} failed: ${detail}`);
@@ -30,11 +26,9 @@ export class GitCommandError extends Error {
     this.stderr = result.stderr;
   }
 }
-
 export class CanonicalityError extends Error {
   readonly expectedBase: string;
   readonly actualHead: string;
-
   constructor(expectedBase: string, actualHead: string, detail: string) {
     super(`canonical branch ambiguity: ${detail}; expected base ${expectedBase}, actual head ${actualHead}`);
     this.name = "CanonicalityError";
@@ -42,14 +36,12 @@ export class CanonicalityError extends Error {
     this.actualHead = actualHead;
   }
 }
-
 export class WorkspaceExistsError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "WorkspaceExistsError";
   }
 }
-
 async function runGitAt(
   repositoryPath: string,
   args: readonly string[],
@@ -82,54 +74,45 @@ async function runGitAt(
     if (options.input !== undefined) child.stdin!.end(options.input);
   });
 }
-
 function normalizeAbsolute(candidate: string): string {
   return path.normalize(path.resolve(candidate));
 }
-
 function samePath(left: string, right: string): boolean {
   const a = normalizeAbsolute(left);
   const b = normalizeAbsolute(right);
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
-
 function trimLine(output: string): string {
   return output.trimEnd().split(/\r?\n/u).at(-1) ?? "";
 }
-
 function safeRelativePath(candidate: string): boolean {
   if (candidate.length === 0 || candidate.includes("\0") || path.isAbsolute(candidate)) return false;
   const normalized = candidate.replaceAll("\\", "/");
   return !normalized.split("/").some((part) => part === ".." || part === "");
 }
-
 export interface RepositoryIdentity {
   repositoryRoot: string;
   gitCommonDir: string;
   bare: boolean;
 }
-
 export interface ChangedPath {
   path: string;
   status: string;
   originalPath: string | null;
   tracked: boolean;
 }
-
 export interface ChangeStatistics {
   files: number;
   additions: number;
   deletions: number;
   binaryFiles: number;
 }
-
 export interface UnsafeModeChange {
   path: string;
   kind: "symlink" | "gitlink";
   oldMode: string | null;
   newMode: string | null;
 }
-
 export interface CheckpointRequest {
   branch: string;
   expectedBase: string;
@@ -141,7 +124,6 @@ export interface CheckpointRequest {
   guard?: () => Promise<void>;
   afterNormalizationRescueVerified?: () => void | Promise<void>;
 }
-
 export interface CheckpointResult {
   commit: string;
   previousHead: string;
@@ -149,39 +131,32 @@ export interface CheckpointResult {
   rescueRef: string | null;
   statistics: ChangeStatistics;
 }
-
 export interface RollbackHooks {
   afterRescueVerified?: () => void | Promise<void>;
   afterReset?: () => void | Promise<void>;
 }
-
 export interface RollbackResult {
   oldHead: string;
   targetCommit: string;
   rescueRef: string;
 }
-
 export interface RevertResult {
   commit: string;
   revertedCommit: string;
 }
-
 const CONTROLLER_ENVIRONMENT: NodeJS.ProcessEnv = {
   GIT_AUTHOR_NAME: "Recovery Loop",
   GIT_AUTHOR_EMAIL: "recovery-loop@localhost",
   GIT_COMMITTER_NAME: "Recovery Loop",
   GIT_COMMITTER_EMAIL: "recovery-loop@localhost",
 };
-
 export class GitRepository {
   readonly repositoryRoot: string;
   readonly gitCommonDir: string;
-
   private constructor(identity: RepositoryIdentity) {
     this.repositoryRoot = identity.repositoryRoot;
     this.gitCommonDir = identity.gitCommonDir;
   }
-
   static async inspect(repositoryPath: string): Promise<RepositoryIdentity> {
     const requested = normalizeAbsolute(repositoryPath);
     const bareResult = await runGitAt(requested, ["rev-parse", "--is-bare-repository"]);
@@ -203,39 +178,32 @@ export class GitRepository {
       bare,
     };
   }
-
   static async open(repositoryPath: string): Promise<GitRepository> {
     const identity = await GitRepository.inspect(repositoryPath);
     if (identity.bare) throw new Error("Recovery Loop requires a non-bare Git repository");
     return new GitRepository(identity);
   }
-
   async git(args: readonly string[], options?: RunGitOptions): Promise<GitResult> {
     return runGitAt(this.repositoryRoot, args, options);
   }
-
   async head(): Promise<string> {
     return trimLine((await this.git(["rev-parse", "HEAD"])).stdout);
   }
-
   async resolveCommit(revision: string): Promise<string> {
     return trimLine((await this.git(["rev-parse", "--verify", `${revision}^{commit}`])).stdout);
   }
-
   async currentBranch(): Promise<string | null> {
     const result = await this.git(["symbolic-ref", "--quiet", "--short", "HEAD"], {
       allowFailure: true,
     });
     return result.exitCode === 0 ? trimLine(result.stdout) : null;
   }
-
   async branchHead(branch: string): Promise<string | null> {
     const result = await this.git(["show-ref", "--verify", "--hash", `refs/heads/${branch}`], {
       allowFailure: true,
     });
     return result.exitCode === 0 ? trimLine(result.stdout) : null;
   }
-
   async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
     const result = await this.git(["merge-base", "--is-ancestor", ancestor, descendant], {
       allowFailure: true,
@@ -243,23 +211,19 @@ export class GitRepository {
     if (result.exitCode !== 0 && result.exitCode !== 1) throw new GitCommandError([], result);
     return result.exitCode === 0;
   }
-
   async commitCount(range: string): Promise<number> {
     const output = trimLine((await this.git(["rev-list", "--count", range])).stdout);
     return Number.parseInt(output, 10);
   }
-
   async commitMessage(commit = "HEAD"): Promise<string> {
     return (await this.git(["show", "-s", "--format=%B", commit])).stdout;
   }
-
   async ensureClean(includeUntracked = true): Promise<void> {
     const changes = await this.changedPaths(includeUntracked);
     if (changes.length > 0) {
       throw new Error(`worktree is not clean: ${changes.map((entry) => entry.path).join(", ")}`);
     }
   }
-
   async changedPaths(includeUntracked = true): Promise<ChangedPath[]> {
     const result = await this.git([
       "status",
@@ -286,11 +250,9 @@ export class GitRepository {
     }
     return changes;
   }
-
   async hasTrackedChanges(): Promise<boolean> {
     return (await this.changedPaths(false)).length > 0;
   }
-
   async changeStatistics(base = "HEAD", target?: string): Promise<ChangeStatistics> {
     const args = ["diff", "--numstat", base];
     if (target !== undefined) args.push(target);
@@ -332,19 +294,16 @@ export class GitRepository {
     }
     return { files: paths.size, additions, deletions, binaryFiles };
   }
-
   async changedPathsBetween(base: string, target: string): Promise<string[]> {
     const result = await this.git(["diff", "--name-only", "--no-renames", "-z", base, target]);
     return [...new Set(result.stdout.split("\0").filter((entry) => entry.length > 0))].sort();
   }
-
   async firstParent(commit: string): Promise<string | null> {
     const result = await this.git(["rev-parse", "--verify", `${commit}^1`], {
       allowFailure: true,
     });
     return result.exitCode === 0 ? trimLine(result.stdout) : null;
   }
-
   async unsafeModeChanges(base = "HEAD"): Promise<UnsafeModeChange[]> {
     const unsafe: UnsafeModeChange[] = [];
     for (const change of await this.changedPaths(true)) {
@@ -366,19 +325,16 @@ export class GitRepository {
     }
     return unsafe;
   }
-
   private async modeAt(revision: string, filePath: string): Promise<string | null> {
     const result = await this.git(["ls-tree", revision, "--", filePath], { allowFailure: true });
     const match = /^(\d{6})\s/u.exec(result.stdout);
     return match?.[1] ?? null;
   }
-
   private async indexMode(filePath: string): Promise<string | null> {
     const result = await this.git(["ls-files", "-s", "--", filePath]);
     const match = /^(\d{6})\s/u.exec(result.stdout);
     return match?.[1] ?? null;
   }
-
   async createAutonomousWorktree(options: {
     baseline?: string;
     branch: string;
@@ -401,7 +357,6 @@ export class GitRepository {
     }
     return { baselineCommit, worktree: await GitRepository.open(options.worktreePath) };
   }
-
   async preflightAutonomousWorktree(options: {
     baseline?: string;
     branch: string;
@@ -442,7 +397,6 @@ export class GitRepository {
     }
     return baselineCommit;
   }
-
   async recreatePersistentWorktree(branch: string, worktreePath: string): Promise<GitRepository> {
     if ((await this.branchHead(branch)) === null) throw new Error(`branch does not exist: ${branch}`);
     if (
@@ -461,7 +415,6 @@ export class GitRepository {
     await this.git(["worktree", "add", worktreePath, branch]);
     return GitRepository.open(worktreePath);
   }
-
   async assertBranchIdentity(branch: string): Promise<string> {
     const current = await this.currentBranch();
     const head = await this.head();
@@ -471,7 +424,6 @@ export class GitRepository {
     }
     return head;
   }
-
   async createRescueRef(refName: string, commit: string): Promise<void> {
     if (!refName.startsWith("recovery-loop/rescue/")) {
       throw new Error(`rescue ref must start with recovery-loop/rescue/: ${refName}`);
@@ -484,7 +436,6 @@ export class GitRepository {
       throw new CanonicalityError(commit, resolved ?? "missing", `rescue ref ${refName} failed verification`);
     }
   }
-
   async checkpoint(request: CheckpointRequest): Promise<CheckpointResult | null> {
     let actualHead = await this.assertBranchIdentity(request.branch);
     let normalizedAgentHead: string | null = null;
@@ -519,7 +470,6 @@ export class GitRepository {
     const staged = await this.git(["diff", "--cached", "--quiet"], { allowFailure: true });
     if (staged.exitCode === 0) return null;
     if (staged.exitCode !== 1) throw new GitCommandError(["diff", "--cached", "--quiet"], staged);
-
     const message = checkpointMessage(request);
     await this.commit(message);
     const commit = await this.head();
@@ -537,7 +487,6 @@ export class GitRepository {
       statistics: await this.changeStatistics(request.expectedBase, commit),
     };
   }
-
   private async commit(message: string): Promise<void> {
     const hooksPath = path.join(this.gitCommonDir, "recovery-loop", "empty-hooks");
     await mkdir(hooksPath, { recursive: true });
@@ -546,7 +495,6 @@ export class GitRepository {
       { environment: CONTROLLER_ENVIRONMENT },
     );
   }
-
   async cleanRevert(options: {
     branch: string;
     expectedHead: string;
@@ -584,7 +532,6 @@ export class GitRepository {
     );
     return { commit: await this.head(), revertedCommit: options.targetCommit };
   }
-
   async hardRollback(options: {
     branch: string;
     expectedHead: string;
@@ -617,7 +564,6 @@ export class GitRepository {
     }
     return { oldHead: actual, targetCommit: options.targetCommit, rescueRef: options.rescueRef };
   }
-
   async prepareDiagnosticWorktree(worktreePath: string, commit: string): Promise<GitRepository> {
     const target = await this.resolveCommit(commit);
     let existing: RepositoryIdentity | null = null;
@@ -646,7 +592,6 @@ export class GitRepository {
     return GitRepository.open(worktreePath);
   }
 }
-
 function checkpointMessage(
   request: Pick<CheckpointRequest, "summary" | "sessionId" | "unitId" | "kind">,
 ): string {
@@ -660,12 +605,10 @@ function checkpointMessage(
     `Recovery-Loop-Kind: ${request.kind}`,
   ].join("\n");
 }
-
 function isPathWithin(candidate: string, parent: string): boolean {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
 }
-
 export async function canonicalPath(candidate: string): Promise<string> {
   try {
     return normalizeAbsolute(await realpath(candidate));

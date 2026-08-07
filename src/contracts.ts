@@ -1,25 +1,16 @@
 export const STATE_SCHEMA_VERSION = 1 as const;
 export const CONFIG_SCHEMA_VERSION = 1 as const;
-
 export class ValidationError extends Error {
   readonly path: string;
-
   constructor(path: string, message: string) {
-    super(`${path}: ${message}`);
-    this.name = "ValidationError";
-    this.path = path;
+    super(`${path}: ${message}`); this.name = "ValidationError"; this.path = path;
   }
 }
-
 export type JsonObject = Record<string, unknown>;
-
 export function expectObject(value: unknown, path: string): JsonObject {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new ValidationError(path, "expected an object");
-  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new ValidationError(path, "expected an object");
   return value as JsonObject;
 }
-
 export function expectExactKeys(
   object: JsonObject,
   path: string,
@@ -38,65 +29,40 @@ export function expectExactKeys(
     }
   }
 }
-
 export function expectString(value: unknown, path: string): string {
-  if (typeof value !== "string") {
-    throw new ValidationError(path, "expected a string");
-  }
+  if (typeof value !== "string") throw new ValidationError(path, "expected a string");
   return value;
 }
-
 export function expectNonEmptyString(value: unknown, path: string): string {
   const string = expectString(value, path);
-  if (string.trim().length === 0) {
-    throw new ValidationError(path, "must not be empty");
-  }
-  if (string.includes("\0")) {
-    throw new ValidationError(path, "must not contain NUL");
-  }
+  if (string.trim().length === 0) throw new ValidationError(path, "must not be empty");
+  if (string.includes("\0")) throw new ValidationError(path, "must not contain NUL");
   return string;
 }
-
 export function expectBoolean(value: unknown, path: string): boolean {
-  if (typeof value !== "boolean") {
-    throw new ValidationError(path, "expected a boolean");
-  }
+  if (typeof value !== "boolean") throw new ValidationError(path, "expected a boolean");
   return value;
 }
-
 export function expectNullableString(value: unknown, path: string): string | null {
   return value === null ? null : expectString(value, path);
 }
-
 export function expectNonNegativeInteger(value: unknown, path: string): number {
-  if (!Number.isSafeInteger(value) || (value as number) < 0) {
-    throw new ValidationError(path, "expected a non-negative safe integer");
-  }
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new ValidationError(path, "expected a non-negative safe integer");
   return value as number;
 }
-
 export function expectPositiveInteger(value: unknown, path: string): number {
   const integer = expectNonNegativeInteger(value, path);
-  if (integer === 0) {
-    throw new ValidationError(path, "expected a positive safe integer");
-  }
+  if (integer === 0) throw new ValidationError(path, "expected a positive safe integer");
   return integer;
 }
-
 export function expectPositiveFiniteNumber(value: unknown, path: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    throw new ValidationError(path, "expected a positive finite number");
-  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) throw new ValidationError(path, "expected a positive finite number");
   return value;
 }
-
 export function expectStringArray(value: unknown, path: string): string[] {
-  if (!Array.isArray(value)) {
-    throw new ValidationError(path, "expected an array");
-  }
+  if (!Array.isArray(value)) throw new ValidationError(path, "expected an array");
   return value.map((entry, index) => expectString(entry, `${path}[${index}]`));
 }
-
 export function expectEnum<const T extends readonly string[]>(
   value: unknown,
   path: string,
@@ -107,21 +73,18 @@ export function expectEnum<const T extends readonly string[]>(
   }
   return value as T[number];
 }
-
 export interface CommandSpec {
   id: string;
   argv: readonly string[];
   timeoutSeconds: number;
   bisectable?: boolean;
 }
-
 export type CommandClassification =
   | "pass"
   | "product"
   | "infrastructure"
   | "flaky"
   | "safety";
-
 export interface CommandResult {
   checkId: string;
   argv: readonly string[];
@@ -141,17 +104,14 @@ export interface CommandResult {
   stderrTail: string;
   error: string | null;
 }
-
 export const AGENT_OUTCOMES = ["changed", "no_change", "goal_complete", "blocked"] as const;
 export type AgentOutcome = (typeof AGENT_OUTCOMES)[number];
-
 export interface AgentResponse {
   outcome: AgentOutcome;
   summary: string;
   nextHint: string | null;
   blocker: string | null;
 }
-
 export function validateAgentResponse(value: unknown): AgentResponse {
   const object = expectObject(value, "agentResponse");
   expectExactKeys(object, "agentResponse", ["outcome", "summary", "nextHint", "blocker"]);
@@ -167,7 +127,6 @@ export function validateAgentResponse(value: unknown): AgentResponse {
   }
   return { outcome, summary, nextHint, blocker };
 }
-
 export const PHASES = [
   "idle",
   "agent-running",
@@ -180,13 +139,10 @@ export const PHASES = [
   "stopped",
 ] as const;
 export type Phase = (typeof PHASES)[number];
-
 export const OPERATION_KINDS = ["workspace", "checkpoint", "revert", "reset", "check", "agent"] as const;
 export type OperationKind = (typeof OPERATION_KINDS)[number];
-
 export const CHECKPOINT_KINDS = ["work", "repair", "interrupted", "revert"] as const;
 export type CheckpointKind = (typeof CHECKPOINT_KINDS)[number];
-
 export interface PendingOperation {
   id: string;
   kind: OperationKind;
@@ -200,7 +156,6 @@ export interface PendingOperation {
   checkpointKind: CheckpointKind | null;
   startedAt: string;
 }
-
 export interface PendingFailure {
   id: string;
   checkId: string;
@@ -215,14 +170,15 @@ export interface PendingFailure {
   recoveryCycles: number;
   latestResultPath: string;
 }
-
 export interface AbandonedRange {
   oldHead: string;
   targetCommit: string;
   rescueRef: string;
   recordedAt: string;
 }
-
+export interface PendingAgentResult {
+  unitId: string; turnId: string; baseCommit: string; response: AgentResponse;
+}
 export interface RecoveryState {
   schemaVersion: typeof STATE_SCHEMA_VERSION;
   repository: {
@@ -245,6 +201,7 @@ export interface RecoveryState {
     turns: number;
     consecutiveNoChange: number;
     threadTurns: number;
+    pendingResult: PendingAgentResult | null;
   };
   health: {
     knownGoodCommit: string | null;
@@ -276,7 +233,6 @@ export interface RecoveryState {
   createdAt: string;
   updatedAt: string;
 }
-
 export type EventType =
   | "session-started"
   | "startup-reconciled"
@@ -295,7 +251,6 @@ export type EventType =
   | "revert-failed"
   | "rollback-completed"
   | "session-stopped";
-
 export interface RecoveryEvent {
   sequence: number;
   timestamp: string;
@@ -304,9 +259,7 @@ export interface RecoveryEvent {
   type: EventType;
   data: Record<string, unknown>;
 }
-
 const HASH_PATTERN = /^[0-9a-f]{40,64}$/;
-
 function expectCommit(value: unknown, path: string): string {
   const commit = expectString(value, path);
   if (!HASH_PATTERN.test(commit)) {
@@ -314,11 +267,9 @@ function expectCommit(value: unknown, path: string): string {
   }
   return commit;
 }
-
 function expectNullableCommit(value: unknown, path: string): string | null {
   return value === null ? null : expectCommit(value, path);
 }
-
 function expectIsoDate(value: unknown, path: string): string {
   const date = expectString(value, path);
   if (!Number.isFinite(Date.parse(date))) {
@@ -326,7 +277,6 @@ function expectIsoDate(value: unknown, path: string): string {
   }
   return date;
 }
-
 function validatePendingOperation(value: unknown, path: string): PendingOperation | null {
   if (value === null) return null;
   const object = expectObject(value, path);
@@ -368,7 +318,6 @@ function validatePendingOperation(value: unknown, path: string): PendingOperatio
     startedAt: expectIsoDate(object.startedAt, `${path}.startedAt`),
   };
 }
-
 function validatePendingFailure(value: unknown, path: string): PendingFailure | null {
   if (value === null) return null;
   const object = expectObject(value, path);
@@ -412,7 +361,6 @@ function validatePendingFailure(value: unknown, path: string): PendingFailure | 
     latestResultPath: expectString(object.latestResultPath, `${path}.latestResultPath`),
   };
 }
-
 function validateAbandonedRange(value: unknown, path: string): AbandonedRange {
   const object = expectObject(value, path);
   expectExactKeys(object, path, ["oldHead", "targetCommit", "rescueRef", "recordedAt"]);
@@ -423,11 +371,20 @@ function validateAbandonedRange(value: unknown, path: string): AbandonedRange {
     recordedAt: expectIsoDate(object.recordedAt, `${path}.recordedAt`),
   };
 }
-
+function validatePendingAgentResult(value: unknown, path: string): PendingAgentResult | null {
+  if (value === null) return null;
+  const object = expectObject(value, path);
+  expectExactKeys(object, path, ["unitId", "turnId", "baseCommit", "response"]);
+  return {
+    unitId: expectNonEmptyString(object.unitId, `${path}.unitId`),
+    turnId: expectNonEmptyString(object.turnId, `${path}.turnId`),
+    baseCommit: expectCommit(object.baseCommit, `${path}.baseCommit`),
+    response: validateAgentResponse(object.response),
+  };
+}
 function expectNullableDate(value: unknown, path: string): string | null {
   return value === null ? null : expectIsoDate(value, path);
 }
-
 export function validateRecoveryState(value: unknown): RecoveryState {
   const state = expectObject(value, "state");
   expectExactKeys(state, "state", [
@@ -451,7 +408,6 @@ export function validateRecoveryState(value: unknown): RecoveryState {
       `unsupported schema version ${String(state.schemaVersion)}`,
     );
   }
-
   const repository = expectObject(state.repository, "state.repository");
   expectExactKeys(repository, "state.repository", [
     "gitCommonDir",
@@ -468,7 +424,7 @@ export function validateRecoveryState(value: unknown): RecoveryState {
     "turns",
     "consecutiveNoChange",
     "threadTurns",
-  ]);
+  ], ["pendingResult"]);
   const health = expectObject(state.health, "state.health");
   expectExactKeys(health, "state.health", [
     "knownGoodCommit",
@@ -499,7 +455,6 @@ export function validateRecoveryState(value: unknown): RecoveryState {
     "reasoningTokens",
     "checkMilliseconds",
   ]);
-
   if (!Array.isArray(recovery.abandonedRanges)) {
     throw new ValidationError("state.recovery.abandonedRanges", "expected an array");
   }
@@ -520,7 +475,6 @@ export function validateRecoveryState(value: unknown): RecoveryState {
       "state.usage.checkMilliseconds",
     ),
   };
-
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
     repository: {
@@ -546,6 +500,7 @@ export function validateRecoveryState(value: unknown): RecoveryState {
         "state.agent.consecutiveNoChange",
       ),
       threadTurns: expectNonNegativeInteger(agent.threadTurns, "state.agent.threadTurns"),
+      pendingResult: agent.pendingResult === undefined ? null : validatePendingAgentResult(agent.pendingResult, "state.agent.pendingResult"),
     },
     health: {
       knownGoodCommit: expectNullableCommit(
@@ -591,7 +546,6 @@ export function validateRecoveryState(value: unknown): RecoveryState {
     updatedAt: expectIsoDate(state.updatedAt, "state.updatedAt"),
   };
 }
-
 export interface InitialStateOptions {
   gitCommonDir: string;
   baselineCommit: string;
@@ -600,7 +554,6 @@ export interface InitialStateOptions {
   sessionId: string;
   now?: string;
 }
-
 export function createInitialState(options: InitialStateOptions): RecoveryState {
   const now = options.now ?? new Date().toISOString();
   return {
@@ -625,6 +578,7 @@ export function createInitialState(options: InitialStateOptions): RecoveryState 
       turns: 0,
       consecutiveNoChange: 0,
       threadTurns: 0,
+      pendingResult: null,
     },
     health: {
       knownGoodCommit: null,

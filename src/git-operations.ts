@@ -11,22 +11,18 @@ import {
   type RollbackResult,
 } from "./git-repository.js";
 import type { StateStore } from "./state-store.js";
-
 export interface OperationHooks {
   afterGitMutation?: (kind: PendingOperation["kind"]) => void | Promise<void>;
   afterRescueVerified?: () => void | Promise<void>;
   afterReset?: () => void | Promise<void>;
 }
-
 export interface JournaledCheckpointRequest extends CheckpointRequest {
   hooks?: OperationHooks;
 }
-
 export interface StartupReconcileOptions {
   guard?: (repository: GitRepository) => Promise<void>;
   hooks?: OperationHooks;
 }
-
 export type StartupAction =
   | "ready"
   | "workspace-recreated"
@@ -43,13 +39,11 @@ export type StartupAction =
   | "revert-conflicted"
   | "stopped"
   | "dirty-worktree";
-
 export interface StartupReconcileResult {
   action: StartupAction;
   state: RecoveryState;
   checkpoint: CheckpointResult | null;
 }
-
 export async function initializeJournaledWorkspace(options: {
   operatorRepository: GitRepository;
   store: StateStore;
@@ -103,7 +97,6 @@ export async function initializeJournaledWorkspace(options: {
   const finished = await options.store.finishOperation(baselineCommit);
   return { state: finished, worktree: result.worktree };
 }
-
 export async function journaledCheckpoint(
   store: StateStore,
   repository: GitRepository,
@@ -152,12 +145,16 @@ export async function journaledCheckpoint(
     await store.appendEvent({
       type: "checkpoint-created",
       headCommit: checkpoint.commit,
-      data: { unitId: request.unitId, kind: request.kind },
+      data: {
+        unitId: request.unitId,
+        kind: request.kind,
+        normalizedAgentHead: checkpoint.normalizedAgentHead,
+        rescueRef: checkpoint.rescueRef,
+      },
     });
   }
   return checkpoint;
 }
-
 export async function journaledCleanRevert(
   store: StateStore,
   repository: GitRepository,
@@ -190,7 +187,6 @@ export async function journaledCleanRevert(
   });
   return result;
 }
-
 export async function journaledHardRollback(
   store: StateStore,
   repository: GitRepository,
@@ -228,7 +224,6 @@ export async function journaledHardRollback(
   await finishRollback(store, result);
   return result;
 }
-
 export async function reconcileStartup(
   repositoryWithCommonDir: GitRepository,
   store: StateStore,
@@ -238,7 +233,6 @@ export async function reconcileStartup(
   if (!samePath(state.repository.gitCommonDir, repositoryWithCommonDir.gitCommonDir)) {
     throw new Error("state belongs to a different repository");
   }
-
   let worktree: GitRepository;
   if (!(await pathExists(state.repository.worktreePath))) {
     const branchHead = await repositoryWithCommonDir.branchHead(state.repository.branch);
@@ -283,7 +277,6 @@ export async function reconcileStartup(
     state = await store.finishOperation(branchHead);
     return { action: "workspace-recreated", state, checkpoint: null };
   }
-
   worktree = await GitRepository.open(state.repository.worktreePath);
   await store.assertRepositoryIdentity({
     gitCommonDir: worktree.gitCommonDir,
@@ -302,7 +295,6 @@ export async function reconcileStartup(
       "known-good commit is not an ancestor of the active head",
     );
   }
-
   if (state.phase === "checkpointing") {
     if (state.operation?.kind === "workspace") {
       if (actualHead !== state.repository.baselineCommit) {
@@ -317,15 +309,19 @@ export async function reconcileStartup(
     }
     return continueCheckpoint(store, worktree, state, options);
   }
-
   if (state.phase === "rolling-back") {
     return continueRollback(store, worktree, state, options);
   }
-
-  if (actualHead !== state.repository.expectedHead) {
+  const agentMayHaveMovedHead =
+    state.phase === "agent-running" ||
+    state.phase === "repairing" ||
+    (state.phase === "idle" && state.agent.pendingResult !== null);
+  if (
+    actualHead !== state.repository.expectedHead &&
+    (!agentMayHaveMovedHead || !(await worktree.isAncestor(state.repository.expectedHead, actualHead)))
+  ) {
     await stopForCanonicality(store, state.repository.expectedHead, actualHead);
   }
-
   if (state.phase === "smoke-checking") {
     rejectLiveRecordedCommand(state);
     return { action: "rerun-smoke", state, checkpoint: null };
@@ -342,7 +338,10 @@ export async function reconcileStartup(
     return { action: "stopped", state, checkpoint: null };
   }
   if (state.phase === "agent-running" || state.phase === "repairing") {
-    if ((await worktree.changedPaths(true)).length === 0) {
+    if (
+      actualHead === state.repository.expectedHead &&
+      (await worktree.changedPaths(true)).length === 0
+    ) {
       return {
         action: state.phase === "repairing" ? "resume-repair" : "resume-agent",
         state,
@@ -369,16 +368,19 @@ export async function reconcileStartup(
       checkpoint,
     };
   }
-
-  if ((await worktree.changedPaths(true)).length > 0) {
+  if (
+    (await worktree.changedPaths(true)).length > 0 ||
+    (state.agent.pendingResult !== null && actualHead !== state.repository.expectedHead)
+  ) {
     if (options.guard === undefined) return { action: "dirty-worktree", state, checkpoint: null };
+    const completed = state.agent.pendingResult;
     const checkpoint = await journaledCheckpoint(store, worktree, {
       branch: state.repository.branch,
       expectedBase: state.repository.expectedHead,
-      summary: "preserve unexplained recoverable worktree edits",
+      summary: completed?.response.summary ?? "preserve unexplained recoverable worktree edits",
       sessionId: state.session.id,
-      unitId: `interrupted-${state.eventSequence + 1}`,
-      kind: "interrupted",
+      unitId: completed?.unitId ?? `interrupted-${state.eventSequence + 1}`,
+      kind: completed === null ? "interrupted" : "work",
       guard: async () => options.guard!(worktree),
       ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
     });
@@ -390,7 +392,6 @@ export async function reconcileStartup(
   }
   return { action: "ready", state, checkpoint: null };
 }
-
 async function continueCheckpoint(
   store: StateStore,
   repository: GitRepository,
@@ -413,6 +414,11 @@ async function continueCheckpoint(
     const message = await repository.commitMessage(actual);
     if (count === 1 && operationTrailerMatches(message, state, pending)) {
       const finished = await store.finishOperation(actual);
+      await store.appendEvent({
+        type: "checkpoint-created",
+        headCommit: actual,
+        data: { unitId: pending.unitId, kind: pending.checkpointKind, reconciled: true },
+      });
       return { action: "checkpoint-adopted", state: finished, checkpoint: null };
     }
   }
@@ -423,7 +429,6 @@ async function continueCheckpoint(
     checkpoint,
   };
 }
-
 async function continuePendingCheckpoint(
   store: StateStore,
   repository: GitRepository,
@@ -453,9 +458,21 @@ async function continuePendingCheckpoint(
   });
   await options.hooks?.afterGitMutation?.("checkpoint");
   await store.finishOperation(checkpoint?.commit ?? pending.baseCommit);
+  if (checkpoint !== null) {
+    await store.appendEvent({
+      type: "checkpoint-created",
+      headCommit: checkpoint.commit,
+      data: {
+        unitId: pending.unitId,
+        kind: pending.checkpointKind,
+        reconciled: true,
+        normalizedAgentHead: checkpoint.normalizedAgentHead,
+        rescueRef: checkpoint.rescueRef,
+      },
+    });
+  }
   return checkpoint;
 }
-
 async function continueRollback(
   store: StateStore,
   repository: GitRepository,
@@ -506,7 +523,6 @@ async function continueRollback(
     await finishRollback(store, result);
     return { action: "rollback-finished", state: await store.readState(), checkpoint: null };
   }
-
   if (pending.targetCommit === null || pending.unitId === null) {
     throw new Error("revert operation is missing target or unit ID");
   }
@@ -538,7 +554,6 @@ async function continueRollback(
     checkpoint: null,
   };
 }
-
 async function finishRollback(store: StateStore, result: RollbackResult): Promise<void> {
   await store.finishOperation(result.targetCommit, (draft) => {
     if (!draft.recovery.rescueRefs.includes(result.rescueRef)) {
@@ -562,7 +577,6 @@ async function finishRollback(store: StateStore, result: RollbackResult): Promis
     data: { oldHead: result.oldHead, rescueRef: result.rescueRef },
   });
 }
-
 function operation(
   values: Partial<PendingOperation> & Pick<PendingOperation, "kind" | "baseCommit">,
 ): PendingOperation {
@@ -580,12 +594,10 @@ function operation(
     startedAt: values.startedAt ?? new Date().toISOString(),
   };
 }
-
 function normalizationRef(sessionId: string, unitId: string): string {
   const safe = (value: string): string => value.replaceAll(/[^a-zA-Z0-9._-]+/gu, "-");
   return `recovery-loop/rescue/${safe(sessionId)}-${safe(unitId)}-agent-history`;
 }
-
 function operationTrailerMatches(
   message: string,
   state: RecoveryState,
@@ -599,7 +611,6 @@ function operationTrailerMatches(
       message.includes(`Recovery-Loop-Kind: ${pending.checkpointKind}`))
   );
 }
-
 async function stopForCanonicality(
   store: StateStore,
   expected: string,
@@ -612,7 +623,6 @@ async function stopForCanonicality(
   });
   throw new CanonicalityError(expected, actual, "unexplained non-descendant branch movement");
 }
-
 async function pathExists(candidate: string): Promise<boolean> {
   try {
     await access(candidate);
@@ -622,13 +632,11 @@ async function pathExists(candidate: string): Promise<boolean> {
     throw error;
   }
 }
-
 function samePath(left: string, right: string): boolean {
   const a = new URL(`file:///${left.replaceAll("\\", "/")}`).pathname.toLowerCase();
   const b = new URL(`file:///${right.replaceAll("\\", "/")}`).pathname.toLowerCase();
   return process.platform === "win32" ? a === b : left === right;
 }
-
 export function interruptedOperation(options: {
   baseCommit: string;
   unitId: string;
@@ -643,7 +651,6 @@ export function interruptedOperation(options: {
     checkpointKind: options.kind ?? "interrupted",
   });
 }
-
 function rejectLiveRecordedCommand(state: RecoveryState): void {
   const pid = state.operation?.kind === "check" ? state.operation.childPid : null;
   if (pid === null) return;

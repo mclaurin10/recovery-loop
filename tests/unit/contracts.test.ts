@@ -14,6 +14,9 @@ describe("compact contracts", () => {
       now: "2026-08-07T20:00:00.000Z",
     });
     expect(validateRecoveryState(JSON.parse(JSON.stringify(state)))).toEqual(state);
+    const legacy = JSON.parse(JSON.stringify(state)) as { agent: Record<string, unknown> };
+    delete legacy.agent.pendingResult;
+    expect(validateRecoveryState(legacy).agent.pendingResult).toBeNull();
     expect(() => validateRecoveryState({ ...state, schemaVersion: 2 })).toThrow(
       "unsupported schema version",
     );

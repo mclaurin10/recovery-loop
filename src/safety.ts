@@ -1,9 +1,77 @@
 import { constants as fsConstants } from "node:fs";
+import { createHash } from "node:crypto";
 import { access, lstat, readFile } from "node:fs/promises";
 import path from "node:path";
+import type { CommandClassification } from "./contracts.js";
 import type { GitRepository } from "./git-repository.js";
-import { findSensitiveMaterial } from "./redaction.js";
-
+const SENSITIVE_PATTERNS = [
+  { label: "private-key", expression: /-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY-----[\s\S]*?-----END (?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED) )?PRIVATE KEY-----/giu },
+  { label: "private-key", expression: /-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----/giu },
+  { label: "aws-access-key", expression: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu },
+  { label: "github-token", expression: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,255}\b/gu },
+  { label: "github-token", expression: /\bgithub_pat_[A-Za-z0-9_]{40,255}\b/gu },
+  { label: "gitlab-token", expression: /\bglpat-[A-Za-z0-9_-]{20,255}\b/gu },
+  { label: "slack-token", expression: /\bxox[baprs]-[A-Za-z0-9-]{20,255}\b/gu },
+  { label: "stripe-live-key", expression: /\b[rs]k_live_[A-Za-z0-9]{20,255}\b/gu },
+  { label: "openai-key", expression: /\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,255}\b/gu },
+  { label: "credential-url", expression: /\b(?:https?|postgres(?:ql)?|mysql):\/\/[^\s/:@]{1,128}:[^\s/@]{8,256}@/giu },
+] as const;
+export interface SensitiveMatch { label: string; excerpt: string }
+export function findSensitiveMaterial(text: string): SensitiveMatch[] {
+  const matches: SensitiveMatch[] = [];
+  for (const pattern of SENSITIVE_PATTERNS) for (const match of text.matchAll(pattern.expression)) {
+    const value = match[0];
+    if (value !== undefined) matches.push({ label: pattern.label, excerpt: value.slice(0, 20) });
+  }
+  return matches;
+}
+export function redact(text: string, additionalSecrets: readonly string[] = []): string {
+  let result = text;
+  for (const pattern of SENSITIVE_PATTERNS) result = result.replace(pattern.expression, `[REDACTED ${pattern.label.toUpperCase()}]`);
+  for (const secret of additionalSecrets) if (secret.length >= 4) result = result.replaceAll(secret, "[REDACTED]");
+  return result;
+}
+export class ByteTail {
+  readonly maximumBytes: number;
+  #buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  constructor(maximumBytes: number) {
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0) throw new Error("tail size must be a positive integer");
+    this.maximumBytes = maximumBytes;
+  }
+  append(chunk: Buffer | string): void {
+    const incoming = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    if (incoming.length >= this.maximumBytes) this.#buffer = incoming.subarray(-this.maximumBytes);
+    else {
+      const combined = Buffer.concat([this.#buffer, incoming]);
+      this.#buffer = combined.length > this.maximumBytes ? combined.subarray(-this.maximumBytes) : combined;
+    }
+  }
+  text(): string { return this.#buffer.toString("utf8"); }
+}
+export function boundedRedactedTail(tail: ByteTail, additionalSecrets: readonly string[] = []): string {
+  return redact(tail.text(), additionalSecrets);
+}
+export function normalizeDiagnostic(text: string, variablePaths: readonly string[] = []): string {
+  let normalized = redact(text);
+  for (const variablePath of [...variablePaths].sort((a, b) => b.length - a.length)) {
+    if (variablePath.length > 0) normalized = normalized.replaceAll(variablePath, "<PATH>");
+  }
+  return normalized.replaceAll(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/gu, "<TIME>")
+    .replaceAll(/\b(?:pid|process)[=:# ]+\d+\b/giu, "pid=<PID>")
+    .replaceAll(/(?:[A-Za-z]:[\\/]|\/)(?:[^\s:'"]+[\\/])*(?:tmp|temp)[\\/][^\s:'"]+/giu, "<TEMP_PATH>")
+    .replaceAll(/\s+/gu, " ").trim();
+}
+export function commandSignature(input: {
+  checkId: string; classification: CommandClassification; exitCode: number | null;
+  signal: NodeJS.Signals | null; stdoutTail: string; stderrTail: string;
+  variablePaths?: readonly string[];
+}): string {
+  return createHash("sha256").update(JSON.stringify({
+    checkId: input.checkId, classification: input.classification, exitCode: input.exitCode,
+    signal: input.signal, stdout: normalizeDiagnostic(input.stdoutTail, input.variablePaths),
+    stderr: normalizeDiagnostic(input.stderrTail, input.variablePaths),
+  })).digest("hex");
+}
 export type SafetyViolationCode =
   | "branch-identity"
   | "unexpected-head"
@@ -16,18 +84,15 @@ export type SafetyViolationCode =
   | "sensitive-material"
   | "unscannable-file"
   | "persistence";
-
 export interface SafetyViolation {
   code: SafetyViolationCode;
   message: string;
   path: string | null;
 }
-
 export interface SafetyGuardResult {
   safe: boolean;
   violations: SafetyViolation[];
 }
-
 export interface SafetyGuardOptions {
   expectedBranch: string;
   expectedBase: string;
@@ -35,17 +100,14 @@ export interface SafetyGuardOptions {
   expectedWorktreePath?: string;
   maximumScanBytes?: number;
 }
-
 export class SafetyGuardError extends Error {
   readonly violations: readonly SafetyViolation[];
-
   constructor(violations: readonly SafetyViolation[]) {
     super(`checkpoint guard rejected changes: ${violations.map((item) => item.message).join("; ")}`);
     this.name = "SafetyGuardError";
     this.violations = violations;
   }
 }
-
 const GIT_OPERATION_PATHS = [
   "MERGE_HEAD",
   "CHERRY_PICK_HEAD",
@@ -55,7 +117,6 @@ const GIT_OPERATION_PATHS = [
   "rebase-merge",
   "sequencer",
 ] as const;
-
 const RUNTIME_PATHS = [
   ".git",
   ".recovery-loop/state.json",
@@ -64,7 +125,6 @@ const RUNTIME_PATHS = [
   ".recovery-loop/runs/",
   ".recovery-loop/diagnostic-worktree/",
 ] as const;
-
 export async function runSafetyGuard(
   repository: GitRepository,
   options: SafetyGuardOptions,
@@ -97,7 +157,6 @@ export async function runSafetyGuard(
       path: null,
     });
   }
-
   for (const operationPath of GIT_OPERATION_PATHS) {
     const rawPath = (await repository.git(["rev-parse", "--git-path", operationPath])).stdout.trim();
     const absolute = path.isAbsolute(rawPath) ? rawPath : path.join(repository.repositoryRoot, rawPath);
@@ -109,7 +168,6 @@ export async function runSafetyGuard(
       });
     }
   }
-
   const changes = await repository.changedPaths(true);
   const protectedPaths = new Set(options.protectedPaths);
   for (const change of changes) {
@@ -139,7 +197,6 @@ export async function runSafetyGuard(
       }
     }
   }
-
   for (const mode of await repository.unsafeModeChanges(options.expectedBase)) {
     violations.push({
       code: mode.kind,
@@ -147,7 +204,6 @@ export async function runSafetyGuard(
       path: mode.path,
     });
   }
-
   const maximumScanBytes = options.maximumScanBytes ?? 10 * 1024 * 1024;
   for (const change of changes) {
     if (!isContainedRelativePath(change.path, repository.repositoryRoot)) continue;
@@ -204,7 +260,6 @@ export async function runSafetyGuard(
       });
     }
   }
-
   try {
     await access(repository.gitCommonDir, fsConstants.W_OK);
   } catch {
@@ -214,10 +269,8 @@ export async function runSafetyGuard(
       path: null,
     });
   }
-
   return { safe: violations.length === 0, violations: deduplicate(violations) };
 }
-
 export async function assertCheckpointSafe(
   repository: GitRepository,
   options: SafetyGuardOptions,
@@ -225,26 +278,22 @@ export async function assertCheckpointSafe(
   const result = await runSafetyGuard(repository, options);
   if (!result.safe) throw new SafetyGuardError(result.violations);
 }
-
 function matchesProtectedPath(candidate: string, protectedPaths: ReadonlySet<string>): boolean {
   for (const protectedPath of protectedPaths) {
     if (pathRuleMatches(candidate, protectedPath)) return true;
   }
   return false;
 }
-
 function pathRuleMatches(candidate: string, rule: string): boolean {
   if (rule.endsWith("/")) return candidate.startsWith(rule);
   return candidate === rule;
 }
-
 function isContainedRelativePath(candidate: string, worktree: string): boolean {
   if (candidate.includes("\0") || path.isAbsolute(candidate)) return false;
   const absolute = path.resolve(worktree, ...candidate.split("/"));
   const relative = path.relative(path.resolve(worktree), absolute);
   return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
-
 async function exists(candidate: string): Promise<boolean> {
   try {
     await access(candidate);
@@ -254,13 +303,11 @@ async function exists(candidate: string): Promise<boolean> {
     throw error;
   }
 }
-
 function pathsEqual(left: string, right: string): boolean {
   const a = path.resolve(left);
   const b = path.resolve(right);
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
-
 function deduplicate(violations: readonly SafetyViolation[]): SafetyViolation[] {
   const seen = new Set<string>();
   return violations.filter((violation) => {

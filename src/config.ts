@@ -12,13 +12,11 @@ import {
   expectPositiveInteger,
   type CommandSpec,
 } from "./contracts.js";
-
 export interface PrepareConfig {
   argv: readonly string[];
   timeoutSeconds: number;
   triggerPaths: readonly string[];
 }
-
 export interface RecoveryConfig {
   schemaVersion: typeof CONFIG_SCHEMA_VERSION;
   goalFile: string;
@@ -52,11 +50,9 @@ export interface RecoveryConfig {
     networkAccess: false;
   };
 }
-
 const CONFIG_PATH = ".recovery-loop/config.json";
 const CHECK_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 const WINDOWS_ABSOLUTE_PATTERN = /^[a-zA-Z]:[\\/]/;
-
 export function validateRelativePath(value: unknown, valuePath: string): string {
   const candidate = expectNonEmptyString(value, valuePath);
   if (candidate.includes("\\")) {
@@ -72,7 +68,6 @@ export function validateRelativePath(value: unknown, valuePath: string): string 
   }
   return candidate;
 }
-
 function validateArgv(value: unknown, valuePath: string): readonly string[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new ValidationError(valuePath, "expected a non-empty argv array");
@@ -81,7 +76,6 @@ function validateArgv(value: unknown, valuePath: string): readonly string[] {
     expectNonEmptyString(argument, `${valuePath}[${index}]`),
   );
 }
-
 function validateCommand(value: unknown, valuePath: string, deep: boolean): CommandSpec {
   const command = expectObject(value, valuePath);
   expectExactKeys(
@@ -107,14 +101,12 @@ function validateCommand(value: unknown, valuePath: string, deep: boolean): Comm
   }
   return base;
 }
-
 function validateCommandList(value: unknown, valuePath: string, deep: boolean): CommandSpec[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new ValidationError(valuePath, "must contain at least one command");
   }
   return value.map((entry, index) => validateCommand(entry, `${valuePath}[${index}]`, deep));
 }
-
 function validatePathList(value: unknown, valuePath: string): string[] {
   if (!Array.isArray(value)) {
     throw new ValidationError(valuePath, "expected an array");
@@ -127,7 +119,6 @@ function validatePathList(value: unknown, valuePath: string): string[] {
   }
   return paths;
 }
-
 function validatePrepare(value: unknown): PrepareConfig | null {
   if (value === null || value === undefined) return null;
   const prepare = expectObject(value, "config.prepare");
@@ -141,7 +132,6 @@ function validatePrepare(value: unknown): PrepareConfig | null {
     triggerPaths: validatePathList(prepare.triggerPaths, "config.prepare.triggerPaths"),
   };
 }
-
 export function validateConfig(value: unknown): RecoveryConfig {
   const config = expectObject(value, "config");
   expectExactKeys(
@@ -173,7 +163,6 @@ export function validateConfig(value: unknown): RecoveryConfig {
   if (!branch.startsWith("recovery-loop/") || branch === "recovery-loop/") {
     throw new ValidationError("config.branch", "must start with recovery-loop/");
   }
-
   const checks = expectObject(config.checks, "config.checks");
   expectExactKeys(checks, "config.checks", ["smoke", "deep"]);
   const smoke = validateCommandList(checks.smoke, "config.checks.smoke", false);
@@ -182,7 +171,6 @@ export function validateConfig(value: unknown): RecoveryConfig {
   if (new Set(allIds).size !== allIds.length) {
     throw new ValidationError("config.checks", "check IDs must be unique across smoke and deep");
   }
-
   const deepPolicy = expectObject(config.deepPolicy, "config.deepPolicy");
   expectExactKeys(deepPolicy, "config.deepPolicy", [
     "everyCheckpoints",
@@ -215,10 +203,8 @@ export function validateConfig(value: unknown): RecoveryConfig {
       "expected one of: low, medium, high, xhigh",
     );
   }
-
   const protectedPaths = validatePathList(config.protectedPaths, "config.protectedPaths");
   const completeProtectedPaths = [...new Set([...protectedPaths, goalFile, CONFIG_PATH])];
-
   return {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     goalFile,
@@ -280,7 +266,6 @@ export function validateConfig(value: unknown): RecoveryConfig {
     },
   };
 }
-
 export async function loadConfig(worktreePath: string): Promise<RecoveryConfig> {
   const configPath = path.join(worktreePath, ...CONFIG_PATH.split("/"));
   let parsed: unknown;
@@ -294,13 +279,10 @@ export async function loadConfig(worktreePath: string): Promise<RecoveryConfig> 
   }
   return validateConfig(parsed);
 }
-
 export const TRACKED_CONFIG_PATH = CONFIG_PATH;
-
 export interface ScaffoldResult {
   created: string[];
 }
-
 export async function scaffoldContract(repositoryPath: string): Promise<ScaffoldResult> {
   const templateRoot = fileURLToPath(new URL("../templates/", import.meta.url));
   const targets = [

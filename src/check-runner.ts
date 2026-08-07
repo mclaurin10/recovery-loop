@@ -17,20 +17,16 @@ import {
   boundedRedactedTail,
   commandSignature,
   findSensitiveMaterial,
-} from "./redaction.js";
+} from "./safety.js";
 import type { StateStore } from "./state-store.js";
-
 export type CommandCategory = "prepare" | "smoke" | "deep" | "diagnostic";
-
 export interface CommandRunnerHooks {
   beforeOutputOpen?: (commandDirectory: string) => void | Promise<void>;
   afterSpawn?: (pid: number | null) => void | Promise<void>;
 }
-
 export interface CommandSetHooks {
   afterCommand?: (result: CommandResult, index: number) => void | Promise<void>;
 }
-
 export interface RunCommandOptions {
   repository: GitRepository;
   command: CommandSpec;
@@ -43,7 +39,6 @@ export interface RunCommandOptions {
   terminationGraceMs?: number;
   hooks?: CommandRunnerHooks;
 }
-
 export interface ConfirmationResult {
   attempts: CommandResult[];
   confirmedFailure: boolean;
@@ -51,7 +46,6 @@ export interface ConfirmationResult {
   classification: CommandClassification;
   signature: string;
 }
-
 const SENSITIVE_ENVIRONMENT_NAME =
   /(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|AUTHORIZATION|COOKIE|SESSION|AWS_|AZURE_|GITHUB_|GITLAB_|OPENAI_|NPM_|SSH_)/iu;
 const UNSAFE_PROCESS_ENVIRONMENT = new Set([
@@ -65,7 +59,6 @@ const UNSAFE_PROCESS_ENVIRONMENT = new Set([
   "GIT_CONFIG_KEY_0",
   "GIT_CONFIG_VALUE_0",
 ]);
-
 export function sanitizeEnvironment(
   source: NodeJS.ProcessEnv = process.env,
   overrides: NodeJS.ProcessEnv = {},
@@ -97,7 +90,6 @@ export function sanitizeEnvironment(
   sanitized.GIT_TERMINAL_PROMPT = "0";
   return sanitized;
 }
-
 export async function runCommand(options: RunCommandOptions): Promise<CommandResult> {
   const started = Date.now();
   const startedAt = new Date(started).toISOString();
@@ -111,14 +103,12 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
   const tailBytes = options.maximumTailBytes ?? 16 * 1024;
   const stdoutTail = new ByteTail(tailBytes);
   const stderrTail = new ByteTail(tailBytes);
-
   try {
     await mkdir(commandDirectory, { recursive: true });
     await options.hooks?.beforeOutputOpen?.(commandDirectory);
   } catch (error) {
     return setupFailure(options, started, startedAt, error);
   }
-
   const actualHead = await options.repository.head();
   if (actualHead !== options.commit) {
     return writeResult(
@@ -163,7 +153,6 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
       .filter((change) => !change.tracked)
       .map((change) => change.path),
   );
-
   let stdoutStream;
   let stderrStream;
   try {
@@ -175,7 +164,6 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
     stderrStream?.destroy();
     return setupFailure(options, started, startedAt, error);
   }
-
   let spawnError: Error | null = null;
   let outputError: Error | null = null;
   let timedOut = false;
@@ -209,13 +197,11 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
     await terminateProcessTree(child, options.terminationGraceMs ?? 1_000);
     throw error;
   }
-
   const timeout = setTimeout(() => {
     timedOut = true;
     void terminateProcessTree(child, options.terminationGraceMs ?? 1_000);
   }, Math.max(1, Math.round(options.command.timeoutSeconds * 1_000)));
   timeout.unref();
-
   await new Promise<void>((resolve) => {
     child.once("error", (error) => {
       spawnError = error;
@@ -236,7 +222,6 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
           : new Error(String(streamResult.reason));
     }
   }
-
   let worktreeChanged = false;
   let mutationError: string | null = null;
   const headAfter = await options.repository.head();
@@ -255,7 +240,6 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
       mutationError = `check altered tracked source and cleanup failed: ${errorMessage(error)}`;
     }
   }
-
   let classification: CommandClassification;
   let error: string | null = null;
   if (mutationError !== null) {
@@ -278,7 +262,6 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
   } else {
     classification = "product";
   }
-
   const result = makeResult(options, {
     started,
     startedAt,
@@ -295,7 +278,6 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
   });
   return writeResult(resultPath, result);
 }
-
 export async function runCommandSet(options: {
   repository: GitRepository;
   commands: readonly CommandSpec[];
@@ -324,7 +306,6 @@ export async function runCommandSet(options: {
   }
   return results;
 }
-
 export async function runJournaledCommandSet(options: {
   store: StateStore;
   repository: GitRepository;
@@ -392,6 +373,7 @@ export async function runJournaledCommandSet(options: {
       headCommit: options.commit,
       data: {
         checkId: command.id,
+        category: options.category,
         classification: result.classification,
         durationMs: result.durationMs,
       },
@@ -405,7 +387,6 @@ export async function runJournaledCommandSet(options: {
   });
   return results;
 }
-
 export async function confirmFailure(
   first: CommandResult,
   rerun: (attempt: 2 | 3) => Promise<CommandResult>,
@@ -425,7 +406,6 @@ export async function confirmFailure(
     signature: attempts.at(-1)?.signature ?? first.signature,
   };
 }
-
 function findConsensus(results: readonly CommandResult[]): CommandResult | "pass" | null {
   const passes = results.filter((result) => result.classification === "pass");
   if (passes.length >= 2) return "pass";
@@ -440,7 +420,6 @@ function findConsensus(results: readonly CommandResult[]): CommandResult | "pass
   }
   return null;
 }
-
 function confirmation(
   attempts: CommandResult[],
   consensus: CommandResult | "pass",
@@ -462,7 +441,6 @@ function confirmation(
     signature: consensus.signature,
   };
 }
-
 async function terminateProcessTree(child: ChildProcess, graceMs: number): Promise<void> {
   const pid = child.pid;
   if (pid === undefined || child.exitCode !== null) return;
@@ -492,7 +470,6 @@ async function terminateProcessTree(child: ChildProcess, graceMs: number): Promi
   }, graceMs);
   force.unref();
 }
-
 async function restoreTrackedMutation(
   repository: GitRepository,
   commit: string,
@@ -518,7 +495,6 @@ async function restoreTrackedMutation(
     throw new Error("tracked source remained dirty after command cleanup");
   }
 }
-
 interface ResultParts {
   started: number;
   startedAt: string;
@@ -533,7 +509,6 @@ interface ResultParts {
   stderrTail: string;
   error: string | null;
 }
-
 function makeResult(options: RunCommandOptions, parts: ResultParts): CommandResult {
   const finishedAt = new Date().toISOString();
   const result: CommandResult = {
@@ -566,7 +541,6 @@ function makeResult(options: RunCommandOptions, parts: ResultParts): CommandResu
   });
   return result;
 }
-
 async function writeResult(resultPath: string, result: CommandResult): Promise<CommandResult> {
   try {
     await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -588,7 +562,6 @@ async function writeResult(resultPath: string, result: CommandResult): Promise<C
     return failed;
   }
 }
-
 function setupFailure(
   options: RunCommandOptions,
   started: number,
@@ -610,24 +583,20 @@ function setupFailure(
     error: `command output setup failed: ${errorMessage(error)}`,
   });
 }
-
 function safeSegment(value: string): string {
   const safe = value.replaceAll(/[^a-zA-Z0-9._-]+/gu, "-");
   if (safe.length === 0 || safe === "." || safe === "..") throw new Error("unsafe command ID");
   return safe;
 }
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
 function waitForOpen(stream: WriteStream): Promise<void> {
   return new Promise((resolve, reject) => {
     stream.once("open", () => resolve());
     stream.once("error", reject);
   });
 }
-
 function checkPhase(category: CommandCategory): Phase {
   if (category === "deep") return "deep-checking";
   if (category === "diagnostic") return "diagnosing";

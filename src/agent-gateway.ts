@@ -3,9 +3,9 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Codex } from "@openai/codex-sdk";
 import type { RecoveryConfig } from "./config.js";
-import { validateAgentResponse, type AgentResponse, type PendingOperation, type RecoveryState } from "./contracts.js";
+import { validateAgentResponse, type AgentResponse, type PendingAgentResult, type PendingOperation, type RecoveryState } from "./contracts.js";
 import type { GitRepository } from "./git-repository.js";
-import { redact } from "./redaction.js";
+import { redact } from "./safety.js";
 import type { StateStore } from "./state-store.js";
 export const CODEX_SDK_VERSION = "0.147.0" as const;
 export const MAX_AGENT_THREAD_TURNS = 8;
@@ -100,6 +100,7 @@ export class CodexAgentGateway implements AgentGateway {
     assertModeEvidence(request);
     const state = await request.store.readState();
     if (state.phase !== "idle") throw new Error(`agent invocation requires idle state, found ${state.phase}`);
+    if (state.agent.pendingResult !== null) throw new Error("the previous agent result must be handled before another invocation");
     if (request.config.agent.networkAccess) throw new Error("agent network access must be disabled");
     if (!pathsEqual(state.repository.worktreePath, request.repository.repositoryRoot)) throw new Error("agent repository is not the durable autonomous worktree");
     const head = await request.repository.assertBranchIdentity(request.config.branch);
@@ -126,7 +127,6 @@ export class CodexAgentGateway implements AgentGateway {
     };
     await writeJson(invocationPath, metadata);
     await writeFile(eventsPath, "", { encoding: "utf8", flag: "wx", mode: 0o600 });
-
     if (decision.rotated && decision.reason !== null) await recordRotation(request.store, head, decision.reason, state.agent.threadId);
     const operation = agentOperation(request, head, startedAt);
     await request.store.persistIntent(request.mode === "work" ? "agent-running" : "repairing", operation);
@@ -140,7 +140,6 @@ export class CodexAgentGateway implements AgentGateway {
     else request.signal?.addEventListener("abort", cancel, { once: true });
     const timer = setTimeout(() => { timedOut = true; abort.abort(); }, request.config.limits.agentTurnSeconds * 1_000);
     timer.unref();
-
     let threadId: string | null = decision.action === "resume" ? state.agent.threadId : null;
     let usage: AgentUsage | null = null; let fallback = false;
     let startedFresh = decision.action === "start";
@@ -167,7 +166,9 @@ export class CodexAgentGateway implements AgentGateway {
       threadId = attempt.threadId; usage = attempt.usage;
       const response = parseResponse(attempt.finalResponse);
       await writeJson(finalPath, sanitizeAgentResponse(response));
-      await settleState(request.store, head, operation.id, threadId, usage, startedFresh, true);
+      await settleState(request.store, head, operation.id, threadId, usage, startedFresh, true, {
+        unitId: request.unitId, turnId, baseCommit: head, response,
+      });
       Object.assign(metadata, finishMetadata(started, "completed", threadId, usage, fallback, null));
       await writeJson(invocationPath, metadata);
       await request.store.appendEvent({ type: "agent-completed", headCommit: head,
@@ -180,7 +181,7 @@ export class CodexAgentGateway implements AgentGateway {
       const failure = timedOut ? new AgentTimeoutError(request.config.limits.agentTurnSeconds)
         : cancelled ? new AgentCancelledError() : error instanceof Error ? error : new Error(String(error));
       if (error instanceof AttemptFailure) { threadId = error.threadId; usage = error.usage; }
-      await settleState(request.store, head, operation.id, threadId, usage, startedFresh, false);
+      await settleState(request.store, head, operation.id, threadId, usage, startedFresh, false, null);
       Object.assign(metadata, finishMetadata(started, timedOut ? "timed_out" : cancelled ? "cancelled" : "failed", threadId, usage, fallback, failure));
       await writeJson(invocationPath, metadata);
       await request.store.appendEvent({ type: "agent-failed", headCommit: head,
@@ -257,7 +258,11 @@ async function recordRotation(store: StateStore, head: string, reason: ThreadRot
   await store.update((draft) => { draft.agent.threadId = null; draft.agent.threadTurns = 0; });
   await store.appendEvent({ type: "thread-rotated", headCommit: head, data: { reason, oldThreadId } });
 }
-async function settleState(store: StateStore, head: string, operationId: string, threadId: string | null, usage: AgentUsage | null, fresh: boolean, complete: boolean): Promise<void> {
+export async function rotateAgentThread(store: StateStore, head: string, reason: ThreadRotationReason): Promise<void> {
+  const state = await store.readState();
+  if (state.agent.threadId !== null) await recordRotation(store, head, reason, state.agent.threadId);
+}
+async function settleState(store: StateStore, head: string, operationId: string, threadId: string | null, usage: AgentUsage | null, fresh: boolean, complete: boolean, pending: PendingAgentResult | null): Promise<void> {
   const apply = (draft: RecoveryState): void => {
     draft.agent.turns += 1; draft.agent.threadId = threadId;
     draft.agent.threadTurns = threadId === null ? 0 : fresh ? 1 : draft.agent.threadTurns + 1;
@@ -266,6 +271,7 @@ async function settleState(store: StateStore, head: string, operationId: string,
       draft.usage.inputTokens += usage.inputTokens; draft.usage.cachedInputTokens += usage.cachedInputTokens;
       draft.usage.outputTokens += usage.outputTokens; draft.usage.reasoningTokens += usage.reasoningTokens;
     }
+    if (pending !== null) draft.agent.pendingResult = pending;
   };
   if (complete) {
     if ((await store.readState()).operation?.id !== operationId) throw new Error("agent operation changed while settling");

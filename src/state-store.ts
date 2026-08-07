@@ -23,7 +23,6 @@ import {
   type RecoveryEvent,
   type RecoveryState,
 } from "./contracts.js";
-
 export interface StateStoreHooks {
   beforeStateRename?: (temporaryPath: string, destinationPath: string) => void | Promise<void>;
   afterStateRename?: (destinationPath: string) => void | Promise<void>;
@@ -32,7 +31,6 @@ export interface StateStoreHooks {
   beforeLockRelease?: (lockPath: string) => void | Promise<void>;
   beforeEventAppend?: (eventPath: string) => void | Promise<void>;
 }
-
 export interface ControllerLockRecord {
   token: string;
   pid: number;
@@ -40,32 +38,26 @@ export interface ControllerLockRecord {
   startedAt: string;
   command: string;
 }
-
 export type LockSnapshot =
   | { status: "none" }
   | { status: "valid"; record: ControllerLockRecord }
   | { status: "malformed"; error: string };
-
 export class ControllerLockedError extends Error {
   readonly snapshot: Exclude<LockSnapshot, { status: "none" }>;
-
   constructor(message: string, snapshot: Exclude<LockSnapshot, { status: "none" }>) {
     super(message);
     this.name = "ControllerLockedError";
     this.snapshot = snapshot;
   }
 }
-
 export class ControllerLock {
   readonly record: ControllerLockRecord;
   readonly #store: StateStore;
   #released = false;
-
   constructor(store: StateStore, record: ControllerLockRecord) {
     this.#store = store;
     this.record = record;
   }
-
   async release(): Promise<boolean> {
     if (this.#released) return false;
     const released = await this.#store.releaseLock(this.record.token);
@@ -73,19 +65,16 @@ export class ControllerLock {
     return released;
   }
 }
-
 export interface EventReadResult {
   events: RecoveryEvent[];
   corruptLineNumbers: number[];
   ignoredIncompleteFinalLine: boolean;
 }
-
 export interface EventWriteResult {
   event: RecoveryEvent;
   written: boolean;
   error: string | null;
 }
-
 export interface SessionLayout {
   root: string;
   agent: string;
@@ -93,14 +82,12 @@ export interface SessionLayout {
   diagnoses: string;
   summary: string;
 }
-
 export class StateStore {
   readonly runtimeRoot: string;
   readonly statePath: string;
   readonly lockPath: string;
   readonly eventsPath: string;
   readonly hooks: StateStoreHooks;
-
   constructor(gitCommonDir: string, hooks: StateStoreHooks = {}) {
     this.runtimeRoot = path.join(gitCommonDir, "recovery-loop");
     this.statePath = path.join(this.runtimeRoot, "state.json");
@@ -108,7 +95,6 @@ export class StateStore {
     this.eventsPath = path.join(this.runtimeRoot, "events.jsonl");
     this.hooks = hooks;
   }
-
   async initialize(state: RecoveryState): Promise<void> {
     await mkdir(this.runtimeRoot, { recursive: true });
     try {
@@ -119,7 +105,6 @@ export class StateStore {
     }
     await this.writeState(state);
   }
-
   async readState(): Promise<RecoveryState> {
     let parsed: unknown;
     try {
@@ -132,7 +117,6 @@ export class StateStore {
     }
     return validateRecoveryState(parsed);
   }
-
   async writeState(state: RecoveryState): Promise<void> {
     const validated = validateRecoveryState(structuredClone(state));
     await mkdir(this.runtimeRoot, { recursive: true });
@@ -155,7 +139,6 @@ export class StateStore {
       if (!closed) await file.close().catch(() => undefined);
     }
   }
-
   async update(mutator: (draft: RecoveryState) => void, now = new Date().toISOString()): Promise<RecoveryState> {
     const draft = structuredClone(await this.readState());
     mutator(draft);
@@ -163,7 +146,6 @@ export class StateStore {
     await this.writeState(draft);
     return draft;
   }
-
   async persistIntent(phase: Phase, operation: PendingOperation): Promise<RecoveryState> {
     if (phase === "idle" || phase === "stopped") {
       throw new Error(`cannot persist an operation in phase ${phase}`);
@@ -175,7 +157,6 @@ export class StateStore {
     await this.hooks.afterIntentPersisted?.(state);
     return state;
   }
-
   async finishOperation(expectedHead: string, update?: (draft: RecoveryState) => void): Promise<RecoveryState> {
     return this.update((draft) => {
       draft.repository.expectedHead = expectedHead;
@@ -184,7 +165,6 @@ export class StateStore {
       update?.(draft);
     });
   }
-
   async assertRepositoryIdentity(identity: {
     gitCommonDir: string;
     branch: string;
@@ -211,7 +191,6 @@ export class StateStore {
     }
     return state;
   }
-
   async appendEvent(input: {
     type: EventType;
     headCommit: string;
@@ -240,7 +219,6 @@ export class StateStore {
       };
     }
   }
-
   async readEvents(): Promise<EventReadResult> {
     let contents: string;
     try {
@@ -271,7 +249,6 @@ export class StateStore {
     }
     return { events, corruptLineNumbers, ignoredIncompleteFinalLine };
   }
-
   async acquireLock(command: string): Promise<ControllerLock> {
     if (command === "status") throw new Error("status must not acquire the mutating controller lock");
     await mkdir(this.runtimeRoot, { recursive: true });
@@ -296,7 +273,6 @@ export class StateStore {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
-
       const snapshot = await this.peekLock();
       if (snapshot.status === "none") continue;
       if (snapshot.status === "malformed") {
@@ -322,7 +298,6 @@ export class StateStore {
     }
     throw new Error("controller lock changed repeatedly while acquiring it");
   }
-
   async peekLock(): Promise<LockSnapshot> {
     let contents: string;
     try {
@@ -337,7 +312,6 @@ export class StateStore {
       return { status: "malformed", error: error instanceof Error ? error.message : String(error) };
     }
   }
-
   async releaseLock(token: string): Promise<boolean> {
     const snapshot = await this.peekLock();
     if (snapshot.status !== "valid" || snapshot.record.token !== token) return false;
@@ -350,7 +324,6 @@ export class StateStore {
       throw error;
     }
   }
-
   async ensureSessionLayout(sessionId: string): Promise<SessionLayout> {
     if (!/^[a-zA-Z0-9._-]+$/u.test(sessionId)) throw new Error("unsafe session ID");
     const root = path.join(this.runtimeRoot, "runs", sessionId);
@@ -364,7 +337,6 @@ export class StateStore {
     ]);
     return { root, agent, checks, diagnoses, summary: path.join(root, "summary.json") };
   }
-
   async writeSummary(sessionId: string, summary: Record<string, unknown>): Promise<string> {
     const layout = await this.ensureSessionLayout(sessionId);
     const temporary = `${layout.summary}.tmp-${process.pid}-${randomUUID()}`;
@@ -380,7 +352,6 @@ export class StateStore {
     return layout.summary;
   }
 }
-
 function validateLock(value: unknown): ControllerLockRecord {
   const object = expectObject(value, "lock");
   expectExactKeys(object, "lock", ["token", "pid", "hostname", "startedAt", "command"]);
@@ -396,7 +367,6 @@ function validateLock(value: unknown): ControllerLockRecord {
     command: expectNonEmptyString(object.command, "lock.command"),
   };
 }
-
 function validateEvent(value: unknown, valuePath: string): RecoveryEvent {
   const object = expectObject(value, valuePath);
   expectExactKeys(object, valuePath, [
@@ -422,7 +392,6 @@ function validateEvent(value: unknown, valuePath: string): RecoveryEvent {
     data,
   };
 }
-
 function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -431,7 +400,6 @@ function isPidAlive(pid: number): boolean {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
-
 async function syncDirectory(directory: string): Promise<void> {
   if (process.platform === "win32") return;
   const handle = await open(directory, "r");
@@ -441,7 +409,6 @@ async function syncDirectory(directory: string): Promise<void> {
     await handle.close();
   }
 }
-
 function pathsEqual(left: string, right: string): boolean {
   const a = path.resolve(left);
   const b = path.resolve(right);

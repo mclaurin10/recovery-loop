@@ -14,7 +14,7 @@ import {
   commandSignature,
   findSensitiveMaterial,
   redact,
-} from "../../src/redaction.js";
+} from "../../src/safety.js";
 import {
   createTemporaryRepository,
   type TemporaryRepository,

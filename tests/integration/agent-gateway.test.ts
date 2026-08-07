@@ -250,6 +250,7 @@ describe("thread creation, resumption, and rotation", () => {
     ]);
     const gateway = new CodexAgentGateway(sdk);
     await gateway.invoke(invocation(test));
+    await test.store.update((draft) => { draft.agent.pendingResult = null; });
     const resumed = await gateway.invoke(invocation(test));
     expect(sdk.calls.map((call) => call.method)).toEqual(["start", "resume"]);
     expect(sdk.calls[1]?.resumedThreadId).toBe("thread-persisted");
@@ -267,6 +268,7 @@ describe("thread creation, resumption, and rotation", () => {
     ]);
     const gateway = new CodexAgentGateway(sdk);
     await gateway.invoke(invocation(test));
+    await test.store.update((draft) => { draft.agent.pendingResult = null; });
     const result = await gateway.invoke(invocation(test));
     expect(result).toMatchObject({ threadId: "thread-fresh", resumed: false, fallbackToFreshThread: true });
     expect(sdk.calls.map((call) => call.method)).toEqual(["start", "resume", "start"]);
@@ -287,6 +289,7 @@ describe("thread creation, resumption, and rotation", () => {
     ]);
     const gateway = new CodexAgentGateway(sdk);
     await gateway.invoke(invocation(test));
+    await test.store.update((draft) => { draft.agent.pendingResult = null; });
     await gateway.invoke(invocation(test, { threadBoundaries: { force: true } }));
     expect(sdk.calls.map((call) => call.method)).toEqual(["start", "start"]);
     expect(sdk.calls[1]?.prompt).toContain('"freshThreadReason": "forced"');

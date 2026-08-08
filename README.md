@@ -1,20 +1,18 @@
 # Recovery Loop
 
-Recovery Loop is a local, recovery-first autonomous development controller. One coding agent chooses and implements useful work on a dedicated Git branch and persistent worktree. The controller commits each nonempty turn first, then runs project-owned commands and repairs or reverses failures that become visible.
+Recovery Loop is a local, recovery-first autonomous development controller. It gives one coding agent a dedicated Git branch and persistent worktree in which to advance a repository goal. Each nonempty turn becomes a checkpoint commit before project-owned checks run, so failed attempts leave durable evidence and recovery can proceed from a known point.
 
 The central rule is:
 
 > Create a recoverable checkpoint, observe what happened, and repair or reverse failures when they become visible.
 
-Checkpoint commits are provisional recovery points. They are not approvals, completion certifications, or claims that every configured command passed. The autonomous branch may be temporarily broken. `status` therefore reports the current branch head separately from the last known-good anchor.
+Checkpoint commits are provisional by design: they make work recoverable without claiming that it is correct. When checks expose a failure, the controller attempts forward repair, then a clean revert, then verified rollback as a last resort. Work remains isolated from the operator's branch, and the operator decides whether it should ever be pushed, merged, deployed, published, or released.
 
-Recovery Loop has one coding-agent role. There is no planning agent, review agent, admission gate, or internal product judge. An agent completion claim, command health, and external correctness are separate facts:
+## When to use it
 
-- `goal_complete` means only that the coding agent believes the goal is satisfied.
-- A known-good anchor means the complete configured smoke and deep command sets passed at that exact commit.
-- Recovery Loop does not determine external or overall product correctness.
+Recovery Loop fits repository work that can be expressed as a durable goal, advanced incrementally, and evaluated with safe local commands. It is especially useful when you want autonomous work to remain inspectable on an isolated branch and want failed attempts preserved long enough to diagnose or reverse them.
 
-Recovery Loop never automatically pushes, merges into the operator branch, opens a pull request, deploys, publishes, releases, or contacts project services. The operator evaluates the autonomous branch and decides what happens outside it.
+Keep operations that require production credentials, interactive approval, remote mutation, deployment, publishing, or contact with project services in operator-controlled workflows outside Recovery Loop.
 
 ## Requirements
 
@@ -129,6 +127,16 @@ Failed work and failed repair checkpoints normally remain visible. A clean rever
 
 See [Architecture](docs/architecture.md) for authority, state, check scheduling, and recovery details.
 
+## Interpreting the result
+
+Recovery Loop reports three distinct facts rather than collapsing them into a single success claim:
+
+- `goal_complete` means only that the coding agent believes the goal is satisfied.
+- A known-good anchor means the complete configured smoke and deep command sets passed at that exact commit.
+- External and overall product correctness remain for the operator to evaluate.
+
+The current autonomous branch head may be newer than the known-good anchor and may be temporarily unhealthy. `recovery-loop status` reports the two separately so the latest work is never mistaken for the latest fully checked recovery point.
+
 ## Runtime data and summaries
 
 Tracked adopting-project authority consists only of:
@@ -151,7 +159,7 @@ Runtime data lives under the Git common directory:
   runs/<session>/summary.json
 ```
 
-`state.json` is atomically replaced and is semantic recovery state. `events.jsonl` and command/agent logs are diagnostic. A final summary records measurements such as checkpoints, command executions, repairs, reverts, rollbacks, usage, the final head, the known-good anchor, the agent's completion belief, and whether the final head received a deep pass. It explicitly records that external correctness was not evaluated and never assigns a product-success score.
+`state.json` is atomically replaced and is semantic recovery state. `events.jsonl` and command/agent logs are diagnostic. A final summary records measurements such as checkpoints, command executions, repairs, reverts, rollbacks, usage, the final head, the known-good anchor, the agent's completion belief, and whether the final head received a deep pass.
 
 ## Safety and operating limits
 
@@ -163,7 +171,7 @@ Rescue refs are never deleted automatically. Runtime state cannot be reconstruct
 
 ## Opt-in live canary
 
-Ordinary and acceptance tests use a deterministic scripted SDK seam and make no model or network call. Before the first release tag, an operator may explicitly run the disposable production-controller canary:
+Ordinary and acceptance tests use a deterministic scripted SDK seam and make no model or network call. For explicit end-to-end validation, an operator may run the disposable production-controller canary:
 
 ```powershell
 $env:RECOVERY_LOOP_RUN_LIVE_AGENT = "1"

@@ -158,6 +158,41 @@ describe("Stage 8 confirmed forward repair", () => {
     expect(sdk.calls).toHaveLength(2);
     expect(sdk.calls.every((call) => !call.prompt?.includes("Recovery evidence"))).toBe(true);
   }, 60_000);
+
+  it("preserves an uncertain flaky verdict across a stopped-session restart", async () => {
+    const test = await createFixture((config) => {
+      const marker = path.join(fixtures.at(-1)!.root, "uncertain-restart.txt");
+      const source = [
+        'const fs=require("node:fs");const text=fs.readFileSync("source.txt","utf8");',
+        'if(!text.includes("bad"))process.exit(0);',
+        `let n=0;try{n=Number(fs.readFileSync(${JSON.stringify(marker)},"utf8"))}catch{}`,
+        `n+=1;fs.writeFileSync(${JSON.stringify(marker)},String(n));`,
+        'if(n===2)process.exit(0);',
+        'console.error(n===1?"first deterministic-looking failure":"different failure tail");',
+        'process.exit(7);',
+      ].join("");
+      config.checks.smoke = [{ id: "smoke", argv: [process.execPath, "-e", source], timeoutSeconds: 5 }];
+      config.checks.deep = [passCommand("deep")];
+    });
+    const first = await run(test, [{
+      method: "start",
+      response: response("changed", "trigger uncertain evidence"),
+      action: ({ workingDirectory }) => writeFile(path.join(workingDirectory, "source.txt"), "bad\n"),
+    }]);
+    expect(first.result.summary).toMatchObject({
+      stopReason: "recovery-flaky",
+      pendingFailure: { classification: "flaky" },
+    });
+    expect((first.result.summary.pendingFailure as { confirmationAttempts: unknown[] }).confirmationAttempts)
+      .toHaveLength(3);
+
+    const restarted = await run(test, []);
+    expect(restarted.result.summary).toMatchObject({
+      stopReason: "recovery-flaky",
+      pendingFailure: { classification: "flaky" },
+    });
+    expect(String(restarted.result.summary.stopDetail)).not.toContain("exact original command result");
+  }, 60_000);
 });
 
 describe("Stage 8 non-product classifications", () => {

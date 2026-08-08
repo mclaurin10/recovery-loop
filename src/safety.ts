@@ -13,7 +13,10 @@ const SENSITIVE_PATTERNS = [
   { label: "gitlab-token", expression: /\bglpat-[A-Za-z0-9_-]{20,255}\b/gu },
   { label: "slack-token", expression: /\bxox[baprs]-[A-Za-z0-9-]{20,255}\b/gu },
   { label: "stripe-live-key", expression: /\b[rs]k_live_[A-Za-z0-9]{20,255}\b/gu },
-  { label: "openai-key", expression: /\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,255}\b/gu },
+  {
+    label: "openai-key",
+    expression: /\bsk-(?:[A-Za-z0-9]{32,255}|(?:proj|svcacct)-[A-Za-z0-9_-]{40,255})\b/gu,
+  },
   { label: "credential-url", expression: /\b(?:https?|postgres(?:ql)?|mysql):\/\/[^\s/:@]{1,128}:[^\s/@]{8,256}@/giu },
 ] as const;
 export interface SensitiveMatch { label: string; excerpt: string }
@@ -58,7 +61,9 @@ export function normalizeDiagnostic(text: string, variablePaths: readonly string
   }
   return normalized.replaceAll(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/gu, "<TIME>")
     .replaceAll(/\b(?:pid|process)[=:# ]+\d+\b/giu, "pid=<PID>")
-    .replaceAll(/(?:[A-Za-z]:[\\/]|\/)(?:[^\s:'"]+[\\/])*(?:tmp|temp)[\\/][^\s:'"]+/giu, "<TEMP_PATH>")
+    .replaceAll(/(?:[A-Za-z]:[\\/]|\/)(?:[^\s:'"\\/]+[\\/])*(?:tmp|temp)[\\/][^\s:'"]+/giu, "<TEMP_PATH>")
+    .replaceAll(/\b0x[0-9a-f]+\b/giu, "<HEX>")
+    .replaceAll(/\b\d+(?:\.\d+)?\s*(?:ns|(?:u|\u00b5)s|ms|s|sec(?:ond)?s?|m|min(?:ute)?s?)\b/giu, "<DURATION>")
     .replaceAll(/\s+/gu, " ").trim();
 }
 export function commandSignature(input: {
@@ -96,6 +101,7 @@ export interface SafetyGuardResult {
 export interface SafetyGuardOptions {
   expectedBranch: string;
   expectedBase: string;
+  committedBase?: string;
   protectedPaths: readonly string[];
   expectedWorktreePath?: string;
   maximumScanBytes?: number;
@@ -168,7 +174,14 @@ export async function runSafetyGuard(
       });
     }
   }
-  const changes = await repository.changedPaths(true);
+  const changes = options.committedBase === undefined
+    ? await repository.changedPaths(true)
+    : (await repository.changedPathsBetween(options.committedBase, head)).map((changedPath) => ({
+        path: changedPath,
+        status: "committed",
+        originalPath: null,
+        tracked: true,
+      }));
   const protectedPaths = new Set(options.protectedPaths);
   for (const change of changes) {
     for (const changedName of [change.path, change.originalPath].filter(
@@ -197,7 +210,10 @@ export async function runSafetyGuard(
       }
     }
   }
-  for (const mode of await repository.unsafeModeChanges(options.expectedBase)) {
+  const unsafeModes = options.committedBase === undefined
+    ? await repository.unsafeModeChanges(options.expectedBase)
+    : await repository.unsafeModeChangesBetween(options.committedBase, head);
+  for (const mode of unsafeModes) {
     violations.push({
       code: mode.kind,
       message: `changed ${mode.kind} is not allowed: ${mode.path}`,
@@ -208,20 +224,39 @@ export async function runSafetyGuard(
   for (const change of changes) {
     if (!isContainedRelativePath(change.path, repository.repositoryRoot)) continue;
     const absolute = path.join(repository.repositoryRoot, ...change.path.split("/"));
-    let metadata;
-    try {
-      metadata = await lstat(absolute);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      violations.push({
-        code: "unscannable-file",
-        message: `cannot inspect changed file ${change.path}`,
-        path: change.path,
+    let size: number;
+    if (options.committedBase === undefined) {
+      let metadata;
+      try {
+        metadata = await lstat(absolute);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        violations.push({
+          code: "unscannable-file",
+          message: `cannot inspect changed file ${change.path}`,
+          path: change.path,
+        });
+        continue;
+      }
+      if (!metadata.isFile()) continue;
+      size = metadata.size;
+    } else {
+      const existsAtHead = await repository.git(["cat-file", "-e", `${head}:${change.path}`], {
+        allowFailure: true,
       });
-      continue;
+      if (existsAtHead.exitCode !== 0) continue;
+      const rawSize = (await repository.git(["cat-file", "-s", `${head}:${change.path}`])).stdout.trim();
+      size = Number.parseInt(rawSize, 10);
+      if (!Number.isSafeInteger(size) || size < 0) {
+        violations.push({
+          code: "unscannable-file",
+          message: `cannot inspect changed file ${change.path}`,
+          path: change.path,
+        });
+        continue;
+      }
     }
-    if (!metadata.isFile()) continue;
-    if (metadata.size > maximumScanBytes) {
+    if (size > maximumScanBytes) {
       violations.push({
         code: "unscannable-file",
         message: `changed file exceeds the safety scan limit: ${change.path}`,
@@ -230,7 +265,20 @@ export async function runSafetyGuard(
       continue;
     }
     let proposedText: string;
-    if (!change.tracked) {
+    if (options.committedBase !== undefined) {
+      const diff = (
+        await repository.git([
+          "diff",
+          "--no-ext-diff",
+          "--unified=0",
+          options.committedBase,
+          head,
+          "--",
+          change.path,
+        ])
+      ).stdout;
+      proposedText = addedDiffText(diff);
+    } else if (!change.tracked) {
       const contents = await readFile(absolute);
       if (contents.includes(0)) continue;
       proposedText = contents.toString("utf8");
@@ -245,11 +293,7 @@ export async function runSafetyGuard(
           change.path,
         ])
       ).stdout;
-      proposedText = diff
-        .split(/\r?\n/u)
-        .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
-        .map((line) => line.slice(1))
-        .join("\n");
+      proposedText = addedDiffText(diff);
     }
     const sensitive = findSensitiveMaterial(proposedText);
     for (const match of sensitive) {
@@ -277,6 +321,13 @@ export async function assertCheckpointSafe(
 ): Promise<void> {
   const result = await runSafetyGuard(repository, options);
   if (!result.safe) throw new SafetyGuardError(result.violations);
+}
+function addedDiffText(diff: string): string {
+  return diff
+    .split(/\r?\n/u)
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .map((line) => line.slice(1))
+    .join("\n");
 }
 function matchesProtectedPath(candidate: string, protectedPaths: ReadonlySet<string>): boolean {
   for (const protectedPath of protectedPaths) {

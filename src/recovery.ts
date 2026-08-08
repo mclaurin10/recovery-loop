@@ -68,7 +68,10 @@ export async function recoverPendingFailure(
   if (state.agent.turns >= context.config.limits.maxAgentTurns) {
     return { stop: "max-agent-turns", detail: pending.id };
   }
-  if (await countSessionCheckpoints(context.operator, state) >= context.maxCheckpoints) {
+  if (
+    context.maxCheckpoints !== Number.MAX_SAFE_INTEGER &&
+    await countSessionCheckpoints(context.operator, state) >= context.maxCheckpoints
+  ) {
     return { stop: "max-checkpoints", detail: pending.id };
   }
   const abort = context.abortStop();
@@ -108,12 +111,26 @@ async function confirmPendingFailure(
   context: RecoveryControllerOptions,
   pending: PendingFailure,
 ): Promise<RecoveryProcessResult> {
+  if (pending.classification === "safety" && pending.latestResultPath.length === 0) {
+    const detail = `controller safety observation ${pending.checkId} has no command result to confirm`;
+    await context.store.appendEvent({ type: "failure-classified", headCommit: pending.discoveredAtCommit,
+      data: { failureId: pending.id, classification: "safety", confirmed: false, detail } });
+    return { stop: "recovery-safety", detail };
+  }
   let command: CommandSpec;
   let first: CommandResult;
   try {
     command = configuredCommand(context.config, pending.checkId);
-    first = await loadBoundResult(context, pending.latestResultPath, command, pending.discoveredAtCommit);
-    if (first.classification !== pending.classification || first.signature !== pending.signature) {
+    const originalAttempt = pending.confirmationAttempts[0];
+    const originalResultPath = originalAttempt?.resultPath ?? pending.latestResultPath;
+    first = await loadBoundResult(context, originalResultPath, command, pending.discoveredAtCommit);
+    const expectedClassification = originalAttempt?.classification ?? pending.classification;
+    const expectedSignature = originalAttempt?.signature ?? pending.signature;
+    if (
+      (originalAttempt !== undefined && originalAttempt.attempt !== 1) ||
+      first.classification !== expectedClassification ||
+      first.signature !== expectedSignature
+    ) {
       throw new Error("pending failure does not match its exact original command result");
     }
   } catch (error) {
@@ -352,11 +369,16 @@ async function settleFailedRecoveryAgent(
   error: unknown,
 ): Promise<RecoveryProcessResult> {
   const state = await context.store.readState();
-  const guard = (repository: GitRepository): Promise<void> => checkpointGuard(
+  const guard = (
+    repository: GitRepository,
+    expectedHead = state.repository.expectedHead,
+    committedBase?: string,
+  ): Promise<void> => checkpointGuard(
     repository,
     context.config,
-    state.repository.expectedHead,
+    expectedHead,
     state.repository.worktreePath,
+    committedBase,
   );
   const startup = await reconcileStartup(context.operator, context.store, { guard });
   if (startup.checkpoint?.normalizedAgentHead !== null && startup.checkpoint?.normalizedAgentHead !== undefined) {
@@ -567,6 +589,13 @@ export async function resumePendingRecoveryAction(
 }
 
 function configuredCommand(config: RecoveryConfig, checkId: string): CommandSpec {
+  if (checkId === "prepare-baseline" && config.prepare !== null) {
+    return {
+      id: checkId,
+      argv: config.prepare.argv,
+      timeoutSeconds: config.prepare.timeoutSeconds,
+    };
+  }
   const command = [...config.checks.smoke, ...config.checks.deep]
     .find((candidate) => candidate.id === checkId);
   if (command === undefined) throw new Error(`pending failure check is not configured: ${checkId}`);
@@ -606,15 +635,28 @@ function recoveryHealthOptions(context: RecoveryControllerOptions): HealthContro
     config: context.config, now: context.clock().toISOString() };
 }
 async function checkpointGuard(
-  repository: GitRepository, config: RecoveryConfig, expectedBase: string, worktreePath: string,
+  repository: GitRepository,
+  config: RecoveryConfig,
+  expectedBase: string,
+  worktreePath: string,
+  committedBase?: string,
 ): Promise<void> {
   await assertCheckpointSafe(repository, { expectedBranch: config.branch, expectedBase,
-    protectedPaths: config.protectedPaths, expectedWorktreePath: worktreePath });
+    protectedPaths: config.protectedPaths, expectedWorktreePath: worktreePath,
+    ...(committedBase === undefined ? {} : { committedBase }) });
+  if (committedBase !== undefined) {
+    await assertCheckpointSafe(repository, { expectedBranch: config.branch, expectedBase,
+      protectedPaths: config.protectedPaths, expectedWorktreePath: worktreePath });
+  }
 }
 async function countSessionCheckpoints(
   repository: GitRepository, state: RecoveryState,
 ): Promise<number> {
-  const output = (await repository.git(["log", state.repository.branch, "--format=%B%x00"])).stdout;
+  const output = (await repository.git([
+    "log",
+    `${state.repository.baselineCommit}..${state.repository.branch}`,
+    "--format=%B%x00",
+  ])).stdout;
   const trailer = `Recovery-Loop-Session: ${state.session.id}`;
   return output.split("\0").filter((message) => message.includes(trailer)).length;
 }

@@ -274,8 +274,19 @@ describe("Stage 9 delayed localization", () => {
         localization: { status: "aborted" },
       });
       expect(state.health.pendingFailure?.localization?.reason).toContain(boundary);
+      if (boundary === "infrastructure") {
+        const resumed = await run(test, [
+          editSource("fixed after retained window\n", "repair after transient localization timeout"),
+          { method: "resume", response: response("goal_complete", "complete after retained-window repair") },
+        ]);
+        expect(resumed.result.summary).toMatchObject({
+          stopReason: "goal-candidate-ready",
+          regressionsRepaired: 1,
+          pendingFailure: null,
+        });
+      }
     },
-    90_000,
+    120_000,
   );
 
   it("degrades merge history to the smallest proven first-parent window without inventing precision", async () => {

@@ -2,6 +2,7 @@
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { CodexAgentGateway } from "./agent-gateway.js";
+import { MAX_TIMER_MINUTES } from "./config.js";
 import { runNormalController } from "./controller.js";
 import { GitRepository } from "./git-repository.js";
 import {
@@ -60,12 +61,13 @@ function requireValue(argv: readonly string[], index: number, flag: string): str
   }
   return value;
 }
-function positiveInteger(value: string, flag: string): number {
+function positiveInteger(value: string, flag: string, maximum = Number.MAX_SAFE_INTEGER): number {
   if (!/^[1-9][0-9]*$/.test(value)) {
     throw new CliUsageError(`${flag} requires a positive integer`);
   }
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) throw new CliUsageError(`${flag} is too large`);
+  if (parsed > maximum) throw new CliUsageError(`${flag} must be at most ${maximum}`);
   return parsed;
 }
 function rejectDuplicate(seen: Set<string>, flag: string): void {
@@ -118,7 +120,11 @@ function parseRun(argv: readonly string[]): ParsedCommand {
     const key = flags.get(flag);
     if (key === undefined) throw new CliUsageError(`unknown run flag: ${flag}`);
     rejectDuplicate(seen, flag);
-    values[key] = positiveInteger(requireValue(argv, index, flag), flag);
+    values[key] = positiveInteger(
+      requireValue(argv, index, flag),
+      flag,
+      flag === "--max-minutes" ? MAX_TIMER_MINUTES : Number.MAX_SAFE_INTEGER,
+    );
     index += 1;
   }
   return { command: "run", ...values };
@@ -176,9 +182,9 @@ export function helpText(topic?: "init" | "run" | "status" | "check"): string {
       "checkpointed before project checks run; failures enter recovery.",
       "",
       "Options:",
-      "  --max-agent-turns <n>  Cap coding-agent turns for this invocation",
-      "  --max-checkpoints <n>  Cap controller-owned checkpoints for this invocation",
-      "  --max-minutes <n>      Cap wall time for this invocation",
+      "  --max-agent-turns <n>  Cap coding-agent turns in the current durable session",
+      "  --max-checkpoints <n>  Cap checkpoints in the current durable session",
+      "  --max-minutes <n>      Cap wall time from the durable session start",
       "  --help                 Show this help",
       "",
       "Recovery Loop never pushes, merges into the operator branch, deploys, or",

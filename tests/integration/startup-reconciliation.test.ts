@@ -11,6 +11,7 @@ import {
   reconcileStartup,
 } from "../../src/git-operations.js";
 import { CanonicalityError, type GitRepository } from "../../src/git-repository.js";
+import { assertCheckpointSafe, SafetyGuardError } from "../../src/safety.js";
 import { StateStore } from "../../src/state-store.js";
 import {
   createTemporaryRepository,
@@ -118,6 +119,37 @@ describe("workspace interruption boundaries", () => {
     expect(reconciled.action).toBe("workspace-recreated");
     expect(reconciled.state.phase).toBe("idle");
   });
+
+  it("preserves and reconciles a non-workspace operation when the worktree disappeared", async () => {
+    const { fixture, store, worktree } = await journaledFixture();
+    await fixture.write(fixture.worktreePath, "agent-commit.txt", "agent work\n");
+    const agentHead = await fixture.commit(fixture.worktreePath, "agent-created commit");
+    await store.update((draft) => {
+      draft.phase = "agent-running";
+      draft.operation = {
+        id: "op-agent",
+        kind: "agent",
+        unitId: "unit-missing-worktree",
+        baseCommit: fixture.baseline,
+        targetCommit: null,
+        observedHead: fixture.baseline,
+        rescueRef: null,
+        childPid: null,
+        summary: "preserve interrupted agent work",
+        checkpointKind: null,
+        startedAt: "2026-08-07T20:00:00.000Z",
+      };
+    });
+    await rm(fixture.worktreePath, { recursive: true, force: true });
+    const reconciled = await reconcileStartup(fixture.repository, store, {
+      guard: async () => undefined,
+    });
+    expect(reconciled.action).toBe("interrupted-work-checkpointed");
+    expect(await worktree.branchHead("recovery-loop/rescue/rl-test-unit-missing-worktree-agent-history"))
+      .toBe(agentHead);
+    expect(await worktree.commitCount(`${fixture.baseline}..HEAD`)).toBe(1);
+    expect(await worktree.commitMessage()).toContain("Recovery-Loop-Kind: interrupted");
+  });
 });
 
 describe("checkpoint interruption boundaries", () => {
@@ -146,7 +178,7 @@ describe("checkpoint interruption boundaries", () => {
     expect((await store.readState()).phase).toBe("idle");
   });
 
-  it("adopts an already-created checkpoint once after commit but before result state", async () => {
+  it("revalidates an already-created checkpoint after commit but before result state", async () => {
     const { fixture, store, worktree } = await journaledFixture();
     await fixture.write(fixture.worktreePath, "committed.txt", "committed\n");
     await expect(
@@ -166,10 +198,49 @@ describe("checkpoint interruption boundaries", () => {
     ).rejects.toThrow("crash after commit");
     const committedHead = await worktree.head();
     expect((await store.readState()).phase).toBe("checkpointing");
-    const reconciled = await reconcileStartup(fixture.repository, store);
+    let guarded = false;
+    const reconciled = await reconcileStartup(fixture.repository, store, {
+      guard: async () => { guarded = true; },
+    });
     expect(reconciled.action).toBe("checkpoint-adopted");
+    expect(guarded).toBe(true);
     expect((await store.readState()).repository.expectedHead).toBe(committedHead);
     expect(await worktree.commitCount(`${fixture.baseline}..HEAD`)).toBe(1);
+  });
+
+  it("rejects a forged checkpoint trailer when committed content violates the guard", async () => {
+    const { fixture, store, worktree } = await journaledFixture();
+    await store.update((draft) => {
+      draft.phase = "checkpointing";
+      draft.operation = interruptedOperation({
+        baseCommit: fixture.baseline,
+        unitId: "unit-forged",
+        summary: "forged checkpoint",
+        kind: "work",
+      });
+    });
+    await fixture.write(fixture.worktreePath, "RECOVERY_GOAL.md", "agent-owned authority\n");
+    const forged = await fixture.commit(
+      fixture.worktreePath,
+      [
+        "forged controller commit",
+        "",
+        "Recovery-Loop-Session: rl-test",
+        "Recovery-Loop-Unit: unit-forged",
+        "Recovery-Loop-Kind: work",
+      ].join("\n"),
+    );
+    await expect(reconcileStartup(fixture.repository, store, {
+      guard: (_repository, expectedHead = fixture.baseline, committedBase) => assertCheckpointSafe(worktree, {
+        expectedBranch: "recovery-loop/work",
+        expectedBase: expectedHead,
+        expectedWorktreePath: fixture.worktreePath,
+        protectedPaths: ["RECOVERY_GOAL.md", ".recovery-loop/config.json"],
+        ...(committedBase === undefined ? {} : { committedBase }),
+      }),
+    })).rejects.toBeInstanceOf(SafetyGuardError);
+    expect(await worktree.head()).toBe(forged);
+    expect((await store.readState()).phase).toBe("checkpointing");
   });
 
   it("preserves useful dirty work from an interrupted agent phase", async () => {
@@ -379,5 +450,27 @@ describe("non-mutating reconciliation decisions", () => {
       `recorded command PID ${process.pid} is still alive`,
     );
     expect((await store.readState()).phase).toBe("deep-checking");
+  });
+
+  it("reruns a pre-reboot command journal even when its PID has been recycled", async () => {
+    const { fixture, store } = await journaledFixture();
+    await store.update((draft) => {
+      draft.phase = "smoke-checking";
+      draft.operation = {
+        id: "op-recycled-check",
+        kind: "check",
+        unitId: "smoke",
+        baseCommit: fixture.baseline,
+        targetCommit: fixture.baseline,
+        observedHead: fixture.baseline,
+        rescueRef: null,
+        childPid: process.pid,
+        summary: "smoke command set",
+        checkpointKind: null,
+        startedAt: "2000-01-01T00:00:00.000Z",
+      };
+    });
+    const reconciled = await reconcileStartup(fixture.repository, store);
+    expect(reconciled.action).toBe("rerun-smoke");
   });
 });

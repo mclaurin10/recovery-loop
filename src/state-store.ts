@@ -1,13 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   appendFile,
+  copyFile,
   mkdir,
   open,
   readFile,
   rename,
+  type FileHandle,
   unlink,
 } from "node:fs/promises";
-import { hostname } from "node:os";
+import { hostname, uptime } from "node:os";
 import path from "node:path";
 import {
   ValidationError,
@@ -30,6 +33,11 @@ export interface StateStoreHooks {
   afterLockCreated?: (lockPath: string) => void | Promise<void>;
   beforeLockRelease?: (lockPath: string) => void | Promise<void>;
   beforeEventAppend?: (eventPath: string) => void | Promise<void>;
+  beforeStaleLockRename?: (
+    lockPath: string,
+    stalePath: string,
+    inspected: ControllerLockRecord,
+  ) => void | Promise<void>;
 }
 export interface ControllerLockRecord {
   token: string;
@@ -249,6 +257,52 @@ export class StateStore {
     }
     return { events, corruptLineNumbers, ignoredIncompleteFinalLine };
   }
+  async readRecentEvents(maximumEvents: number): Promise<RecoveryEvent[]> {
+    if (!Number.isSafeInteger(maximumEvents) || maximumEvents <= 0) {
+      throw new Error("recent event limit must be a positive safe integer");
+    }
+    let file: FileHandle;
+    try {
+      file = await open(this.eventsPath, "r");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    try {
+      const metadata = await file.stat();
+      let position = metadata.size;
+      const chunks: Buffer[] = [];
+      let newlineCount = 0;
+      const targetLines = maximumEvents + 32;
+      while (position > 0 && newlineCount < targetLines) {
+        const length = Math.min(position, 64 * 1024);
+        position -= length;
+        const chunk = Buffer.allocUnsafe(length);
+        const { bytesRead } = await file.read(chunk, 0, length, position);
+        const contents = chunk.subarray(0, bytesRead);
+        chunks.unshift(contents);
+        for (const byte of contents) if (byte === 0x0a) newlineCount += 1;
+      }
+      const contents = Buffer.concat(chunks).toString("utf8");
+      const lines = contents.split("\n");
+      if (position > 0) lines.shift();
+      if (contents.endsWith("\n")) lines.pop();
+      else lines.pop();
+      const events: RecoveryEvent[] = [];
+      for (let index = lines.length - 1; index >= 0 && events.length < maximumEvents; index -= 1) {
+        const line = lines[index];
+        if (line === undefined || line.length === 0) continue;
+        try {
+          events.push(validateEvent(JSON.parse(line), `recent event ${index + 1}`));
+        } catch {
+          // Recent diagnostic context skips corrupt complete lines; readEvents reports them in full.
+        }
+      }
+      return events.reverse();
+    } finally {
+      await file.close();
+    }
+  }
   async acquireLock(command: string): Promise<ControllerLock> {
     if (command === "status") throw new Error("status must not acquire the mutating controller lock");
     await mkdir(this.runtimeRoot, { recursive: true });
@@ -282,7 +336,7 @@ export class StateStore {
       if (owner.hostname !== hostname()) {
         throw new ControllerLockedError("controller lock belongs to another host", snapshot);
       }
-      if (isPidAlive(owner.pid)) {
+      if (isRecordedProcessAlive(owner.pid, owner.startedAt)) {
         throw new ControllerLockedError(`controller is already running as PID ${owner.pid}`, snapshot);
       }
       const staleName = path.join(
@@ -290,27 +344,27 @@ export class StateStore {
         `controller.lock.stale-${Date.now()}-${owner.token}`,
       );
       try {
+        await this.hooks.beforeStaleLockRename?.(this.lockPath, staleName, owner);
         await rename(this.lockPath, staleName);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
       }
+      const quarantined = await readLockSnapshot(staleName);
+      if (quarantined.status !== "valid" || quarantined.record.token !== owner.token) {
+        try {
+          await copyFile(staleName, this.lockPath, fsConstants.COPYFILE_EXCL);
+          await syncDirectory(this.runtimeRoot);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+        continue;
+      }
     }
     throw new Error("controller lock changed repeatedly while acquiring it");
   }
   async peekLock(): Promise<LockSnapshot> {
-    let contents: string;
-    try {
-      contents = await readFile(this.lockPath, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "none" };
-      throw error;
-    }
-    try {
-      return { status: "valid", record: validateLock(JSON.parse(contents)) };
-    } catch (error) {
-      return { status: "malformed", error: error instanceof Error ? error.message : String(error) };
-    }
+    return readLockSnapshot(this.lockPath);
   }
   async releaseLock(token: string): Promise<boolean> {
     const snapshot = await this.peekLock();
@@ -350,6 +404,20 @@ export class StateStore {
     await rename(temporary, layout.summary);
     await syncDirectory(layout.root);
     return layout.summary;
+  }
+}
+async function readLockSnapshot(lockPath: string): Promise<LockSnapshot> {
+  let contents: string;
+  try {
+    contents = await readFile(lockPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "none" };
+    throw error;
+  }
+  try {
+    return { status: "valid", record: validateLock(JSON.parse(contents)) };
+  } catch (error) {
+    return { status: "malformed", error: error instanceof Error ? error.message : String(error) };
   }
 }
 function validateLock(value: unknown): ControllerLockRecord {
@@ -399,6 +467,12 @@ function isPidAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+export function isRecordedProcessAlive(pid: number, recordedAt: string): boolean {
+  const recorded = Date.parse(recordedAt);
+  const approximateBoot = Date.now() - uptime() * 1_000;
+  if (Number.isFinite(recorded) && recorded < approximateBoot - 5 * 60_000) return false;
+  return isPidAlive(pid);
 }
 async function syncDirectory(directory: string): Promise<void> {
   if (process.platform === "win32") return;

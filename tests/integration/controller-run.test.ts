@@ -172,7 +172,7 @@ describe("Stage 7 normal controller cycles", () => {
     expect(state.health.pendingFailure).toBeNull();
     expect(state.health.knownGoodCommit).toBe(await test.worktree.head());
     expect(await test.worktree.commitCount(`${state.repository.baselineCommit}..HEAD`)).toBe(2);
-  });
+  }, 60_000);
 
   it("treats a valid hard blocker as terminal without inventing recovery work", async () => {
     const created = await fixture();
@@ -283,6 +283,38 @@ describe("Stage 7 bounded stops and interruption", () => {
     expect(await test.worktree.commitCount(`${state.repository.baselineCommit}..HEAD`)).toBe(1);
     const checkpointEvents = (await test.store.readEvents()).events.filter((event) => event.type === "checkpoint-created");
     expect(checkpointEvents).toHaveLength(1);
+  });
+
+  it("reconciles a stopped session journal before creating the next session", async () => {
+    const test = await initialize(await fixture());
+    const before = await test.store.readState();
+    await test.store.update((draft) => {
+      draft.session.status = "stopped";
+      draft.session.stopReason = "operator-check";
+      draft.phase = "smoke-checking";
+      draft.operation = {
+        id: "op-live-smoke",
+        kind: "check",
+        unitId: "smoke",
+        baseCommit: before.repository.expectedHead,
+        targetCommit: before.repository.expectedHead,
+        observedHead: before.repository.expectedHead,
+        rescueRef: null,
+        childPid: process.pid,
+        summary: "smoke command set",
+        checkpointKind: null,
+        startedAt: new Date().toISOString(),
+      };
+    });
+    await expect(runNormalController({
+      repository: test.fixture.repository,
+      store: test.store,
+      gateway: new CodexAgentGateway(new ScriptedAgentSdk([])),
+    })).rejects.toThrow(`recorded command PID ${process.pid} is still alive`);
+    const after = await test.store.readState();
+    expect(after.session.id).toBe(before.session.id);
+    expect(after.phase).toBe("smoke-checking");
+    expect(after.operation?.id).toBe("op-live-smoke");
   });
 
   it("refuses lock contention and leaves the active owner intact", async () => {

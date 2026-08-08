@@ -100,6 +100,43 @@ describe("bounded argv-only command execution", () => {
     expect(result.error).toContain("could not start");
   });
 
+  it("records a synchronous spawn rejection as infrastructure failure", async () => {
+    const { fixture, worktree, logRoot } = await checkedFixture();
+    const result = await runCommand({
+      repository: worktree,
+      command: { id: "invalid-executable", argv: ["invalid\0executable"], timeoutSeconds: 2 },
+      commit: fixture.baseline,
+      category: "smoke",
+      logRoot,
+      sequence: 1,
+    });
+    expect(result).toMatchObject({ classification: "infrastructure", exitCode: null });
+    expect(result.error).toContain("could not start");
+    await expect(readFile(path.join(path.dirname(result.stdoutPath!), "result.json"), "utf8"))
+      .resolves.toContain('"classification": "infrastructure"');
+  });
+
+  it("bounds output draining when a surviving grandchild retains the pipes", async () => {
+    const { fixture, worktree, logRoot } = await checkedFixture();
+    const grandchild = "setTimeout(() => {}, 2000)";
+    const parent = [
+      'const { spawn } = require("node:child_process");',
+      `spawn(process.execPath, ["-e", ${JSON.stringify(grandchild)}], { stdio: ["ignore", process.stdout, process.stderr] }).unref();`,
+    ].join("");
+    const started = Date.now();
+    const result = await runCommand({
+      repository: worktree,
+      command: nodeCommand("leaked-grandchild", parent),
+      commit: fixture.baseline,
+      category: "smoke",
+      logRoot,
+      sequence: 1,
+      terminationGraceMs: 50,
+    });
+    expect(result.classification).toBe("pass");
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
   it("times out and terminates a spawned child process", async () => {
     const { fixture, worktree, logRoot } = await checkedFixture();
     const marker = path.join(fixture.root, "late-child-marker.txt");

@@ -5,6 +5,7 @@ import type {
   GitRepository} from "../../src/git-repository.js";
 import {
   CanonicalityError,
+  isPathWithin,
   WorkspaceExistsError,
 } from "../../src/git-repository.js";
 import {
@@ -48,6 +49,10 @@ async function checkpoint(
 }
 
 describe("Git workspace", () => {
+  it.runIf(process.platform === "win32")("does not treat a path on another drive as contained", () => {
+    expect(isPathWithin("D:\\recovery-loop-worktree", "C:\\operator-checkout")).toBe(false);
+  });
+
   it("creates an isolated branch and persistent worktree without moving the operator checkout", async () => {
     const fixture = await createTemporaryRepository();
     fixtures.push(fixture);
@@ -91,6 +96,29 @@ describe("Git workspace", () => {
     );
     expect(await recreated.head()).toBe(fixture.baseline);
     expect(await fixture.repository.currentBranch()).toBe("main");
+  });
+
+  it("ignores repository-selecting Git environment inherited by the controller", async () => {
+    const fixture = await createTemporaryRepository();
+    fixtures.push(fixture);
+    const previous = {
+      GIT_DIR: process.env.GIT_DIR,
+      GIT_WORK_TREE: process.env.GIT_WORK_TREE,
+      GIT_INDEX_FILE: process.env.GIT_INDEX_FILE,
+    };
+    try {
+      process.env.GIT_DIR = path.join(fixture.root, "wrong.git");
+      process.env.GIT_WORK_TREE = path.join(fixture.root, "wrong-worktree");
+      process.env.GIT_INDEX_FILE = path.join(fixture.root, "wrong-index");
+      expect(await fixture.repository.head()).toBe(fixture.baseline);
+    } finally {
+      if (previous.GIT_DIR === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = previous.GIT_DIR;
+      if (previous.GIT_WORK_TREE === undefined) delete process.env.GIT_WORK_TREE;
+      else process.env.GIT_WORK_TREE = previous.GIT_WORK_TREE;
+      if (previous.GIT_INDEX_FILE === undefined) delete process.env.GIT_INDEX_FILE;
+      else process.env.GIT_INDEX_FILE = previous.GIT_INDEX_FILE;
+    }
   });
 
   it("uses a detached diagnostic worktree without moving the active branch", async () => {

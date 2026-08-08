@@ -28,6 +28,7 @@ describe("CLI parsing", () => {
       "may only be specified once",
     );
     expect(() => parseCli(["run", "--max-minutes", "0"])).toThrow("positive integer");
+    expect(() => parseCli(["run", "--max-minutes", "35792"])).toThrow("at most 35791");
   });
 
   it("dispatches to one explicit handler", async () => {

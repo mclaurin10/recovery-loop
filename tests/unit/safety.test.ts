@@ -13,6 +13,7 @@ import {
   boundedRedactedTail,
   commandSignature,
   findSensitiveMaterial,
+  normalizeDiagnostic,
   redact,
 } from "../../src/safety.js";
 import {
@@ -113,6 +114,13 @@ describe("checkpoint safety guard", () => {
     expect((await runSafetyGuard(worktree, guard)).violations).toEqual([]);
   });
 
+  it("does not mistake ordinary kebab-case identifiers for OpenAI keys", () => {
+    expect(findSensitiveMaterial("sk-circle-fade-dot-pulse-animation-delay")).toEqual([]);
+    expect(findSensitiveMaterial(`sk-${"A".repeat(48)}`)).toEqual([
+      expect.objectContaining({ label: "openai-key" }),
+    ]);
+  });
+
   it("rejects changed symlinks and gitlinks", async () => {
     const { fixture, worktree, guard } = await guardedFixture();
     const linkBlob = await fixture.git(fixture.worktreePath, ["hash-object", "-w", "--stdin"], "../outside");
@@ -187,5 +195,14 @@ describe("redaction and stable failure signatures", () => {
       stderrTail: "same   failure",
     });
     expect(first).toBe(second);
+  });
+
+  it("normalizes volatile durations, addresses, and temporary paths without pathological backtracking", () => {
+    const deepPath = `/${Array.from({ length: 80 }, (_, index) => `segment-${index}`).join("/")}/module.js`;
+    expect(normalizeDiagnostic(deepPath)).toBe(deepPath);
+    expect(normalizeDiagnostic("failed in 127.4 ms at 0x7ffeefbff5c0")).toBe(
+      "failed in <DURATION> at <HEX>",
+    );
+    expect(normalizeDiagnostic("at /var/tmp/run-123/output.log")).toBe("at <TEMP_PATH>");
   });
 });

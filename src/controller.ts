@@ -65,19 +65,34 @@ export async function runNormalController(options: RunControllerOptions): Promis
 async function runLocked(options: RunControllerOptions, store: StateStore): Promise<RunControllerResult> {
   const clock = options.clock ?? (() => new Date());
   let state = await store.readState();
-  if (state.phase === "stopped" || state.session.status === "stopped") {
-    state = await beginNewSession(store, state, clock());
-  }
+  const startNewSession = state.phase === "stopped" || state.session.status === "stopped";
   const config = effectiveConfig(await configAt(options.repository, state), options.limits);
   if (config.branch !== state.repository.branch) throw new Error("tracked config branch differs from durable state");
   const maxCheckpoints = options.limits?.maxCheckpoints ?? Number.MAX_SAFE_INTEGER;
-  const linked = linkedSignal(options.signal, Date.parse(state.session.startedAt) + config.limits.maxWallMinutes * 60_000, clock);
+  let linked: ReturnType<typeof linkedSignal> | undefined;
   let worktree: GitRepository;
   try {
-    await store.appendEvent({ type: "session-started", headCommit: state.repository.expectedHead, data: { command: "run" } });
-    const guard = (repository: GitRepository): Promise<void> => checkpointGuard(repository, config, state.repository.expectedHead, state.repository.worktreePath);
+    const guard = (
+      repository: GitRepository,
+      expectedHead = state.repository.expectedHead,
+      committedBase?: string,
+    ): Promise<void> => checkpointGuard(
+      repository,
+      config,
+      expectedHead,
+      state.repository.worktreePath,
+      committedBase,
+    );
     const startup = await reconcileStartup(options.repository, store, { guard });
-    worktree = await GitRepository.open((await store.readState()).repository.worktreePath);
+    state = await store.readState();
+    if (startNewSession) state = await beginNewSession(store, state, clock());
+    linked = linkedSignal(
+      options.signal,
+      Date.parse(state.session.startedAt) + config.limits.maxWallMinutes * 60_000,
+      clock,
+    );
+    await store.appendEvent({ type: "session-started", headCommit: state.repository.expectedHead, data: { command: "run" } });
+    worktree = await GitRepository.open(state.repository.worktreePath);
     if (startup.checkpoint?.normalizedAgentHead !== null && startup.checkpoint?.normalizedAgentHead !== undefined) {
       await rotateAgentThread(store, startup.checkpoint.commit, "agent-history-violation");
     }
@@ -90,13 +105,14 @@ async function runLocked(options: RunControllerOptions, store: StateStore): Prom
     }
     await options.hooks?.afterStartup?.(startup);
   } catch (error) {
-    linked.dispose();
+    linked?.dispose();
     if (error instanceof SafetyGuardError) {
       await appendGuardEvent(store, error);
       return await stopSession(options.repository, store, "guard-rejected", error.message, clock);
     }
     throw error;
   }
+  if (linked === undefined) throw new Error("controller signal was not initialized");
   const context: LoopContext = {
     operator: options.repository, worktree, store, gateway: options.gateway, config,
     maxCheckpoints, signal: linked.signal, clock,
@@ -136,7 +152,10 @@ async function runLocked(options: RunControllerOptions, store: StateStore): Prom
       }
       state = await store.readState();
       if (state.agent.turns >= config.limits.maxAgentTurns) return await stopSession(context.operator, store, "max-agent-turns", null, clock);
-      if (await countSessionCheckpoints(context.operator, state) >= maxCheckpoints) return await stopSession(context.operator, store, "max-checkpoints", null, clock);
+      if (
+        maxCheckpoints !== Number.MAX_SAFE_INTEGER &&
+        await countSessionCheckpoints(context.operator, state) >= maxCheckpoints
+      ) return await stopSession(context.operator, store, "max-checkpoints", null, clock);
       const boundary = stopForAbort(context.signal);
       if (boundary !== null) return await stopSession(context.operator, store, boundary, null, clock);
       const unitId = `unit-${String(state.agent.turns + 1).padStart(5, "0")}`;
@@ -197,7 +216,17 @@ async function processAgentResult(context: LoopContext, pending: PendingAgentRes
 
 async function settleFailedAgent(context: LoopContext, error: unknown): Promise<ProcessResult> {
   const state = await context.store.readState();
-  const guard = (repository: GitRepository): Promise<void> => checkpointGuard(repository, context.config, state.repository.expectedHead, state.repository.worktreePath);
+  const guard = (
+    repository: GitRepository,
+    expectedHead = state.repository.expectedHead,
+    committedBase?: string,
+  ): Promise<void> => checkpointGuard(
+    repository,
+    context.config,
+    expectedHead,
+    state.repository.worktreePath,
+    committedBase,
+  );
   const startup = await reconcileStartup(context.operator, context.store, { guard });
   if (startup.checkpoint?.normalizedAgentHead !== null && startup.checkpoint?.normalizedAgentHead !== undefined) {
     await rotateAgentThread(context.store, startup.checkpoint.commit, "agent-history-violation");
@@ -253,11 +282,26 @@ function recoveryOptions(context: LoopContext): RecoveryControllerOptions {
     ...(context.hooks === undefined ? {} : { stage9Hooks: context.hooks }),
   };
 }
-async function checkpointGuard(repository: GitRepository, config: RecoveryConfig, expectedBase: string, worktreePath: string): Promise<void> {
+async function checkpointGuard(
+  repository: GitRepository,
+  config: RecoveryConfig,
+  expectedBase: string,
+  worktreePath: string,
+  committedBase?: string,
+): Promise<void> {
   await assertCheckpointSafe(repository, {
     expectedBranch: config.branch, expectedBase, protectedPaths: config.protectedPaths,
     expectedWorktreePath: worktreePath,
+    ...(committedBase === undefined ? {} : { committedBase }),
   });
+  if (committedBase !== undefined) {
+    await assertCheckpointSafe(repository, {
+      expectedBranch: config.branch,
+      expectedBase,
+      protectedPaths: config.protectedPaths,
+      expectedWorktreePath: worktreePath,
+    });
+  }
 }
 
 async function stopSession(operator: GitRepository, store: StateStore, reason: RunStopReason, detail: string | null, clock: () => Date): Promise<RunControllerResult> {
@@ -327,7 +371,10 @@ async function beginNewSession(store: StateStore, previous: RecoveryState, now: 
   const timestamp = now.toISOString();
   return store.update((draft) => {
     draft.session = { id: sessionId(now), startedAt: timestamp, status: "running", stopReason: null };
-    draft.phase = "idle"; draft.operation = null;
+    if (previous.phase === "stopped") {
+      draft.phase = "idle";
+      draft.operation = null;
+    }
     draft.agent.turns = 0; draft.agent.consecutiveNoChange = 0;
     draft.usage = { agentTurns: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, checkMilliseconds: 0 };
     if (previous.agent.pendingResult === null) draft.agent.pendingResult = null;
@@ -345,7 +392,11 @@ function effectiveConfig(config: RecoveryConfig, limits: RunLimits | undefined):
   } };
 }
 async function countSessionCheckpoints(repository: GitRepository, state: RecoveryState): Promise<number> {
-  const output = (await repository.git(["log", state.repository.branch, "--format=%B%x00"])).stdout;
+  const output = (await repository.git([
+    "log",
+    `${state.repository.baselineCommit}..${state.repository.branch}`,
+    "--format=%B%x00",
+  ])).stdout;
   const trailer = `Recovery-Loop-Session: ${state.session.id}`;
   return output.split("\0").filter((message) => message.includes(trailer)).length;
 }

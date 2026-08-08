@@ -120,6 +120,18 @@ describe("event history", () => {
     expect((await store.readState()).eventSequence).toBe(1);
   });
 
+  it("reads a bounded recent event tail without reparsing the complete log", async () => {
+    const { store } = await storeFixture();
+    for (let index = 0; index < 20; index += 1) {
+      await store.appendEvent({
+        type: "checkpoint-created",
+        headCommit: commit,
+        data: { index },
+      });
+    }
+    expect((await store.readRecentEvents(3)).map((event) => event.data.index)).toEqual([17, 18, 19]);
+  });
+
   it("treats event append failure as nonsemantic after state remains durable", async () => {
     const { root, store } = await storeFixture();
     const failing = new StateStore(path.join(root, ".git"), {
@@ -159,6 +171,51 @@ describe("single-controller lock", () => {
     expect(acquired.record.token).not.toBe(dead.token);
     expect((await readdir(store.runtimeRoot)).some((name) => name.includes("stale-") && name.includes("dead-token")))
       .toBe(true);
+    await acquired.release();
+  });
+
+  it("does not steal a replacement lock that appears during stale takeover", async () => {
+    const { root, store } = await storeFixture();
+    const dead: ControllerLockRecord = {
+      token: "dead-token",
+      pid: 2_000_000_000,
+      hostname: hostname(),
+      startedAt: "2026-08-07T20:00:00.000Z",
+      command: "run",
+    };
+    const replacement: ControllerLockRecord = {
+      token: "replacement-token",
+      pid: process.pid,
+      hostname: hostname(),
+      startedAt: new Date().toISOString(),
+      command: "check",
+    };
+    await writeFile(store.lockPath, JSON.stringify(dead), "utf8");
+    let replaced = false;
+    const racing = new StateStore(path.join(root, ".git"), {
+      beforeStaleLockRename: async (lockPath) => {
+        if (replaced) return;
+        replaced = true;
+        await writeFile(lockPath, JSON.stringify(replacement), "utf8");
+      },
+    });
+    await expect(racing.acquireLock("run")).rejects.toThrow(
+      `controller is already running as PID ${process.pid}`,
+    );
+    expect(await store.peekLock()).toEqual({ status: "valid", record: replacement });
+  });
+
+  it("does not treat a recycled post-reboot PID as the stale lock owner", async () => {
+    const { store } = await storeFixture();
+    await writeFile(store.lockPath, JSON.stringify({
+      token: "pre-reboot-token",
+      pid: process.pid,
+      hostname: hostname(),
+      startedAt: "2000-01-01T00:00:00.000Z",
+      command: "run",
+    }), "utf8");
+    const acquired = await store.acquireLock("run");
+    expect(acquired.record.token).not.toBe("pre-reboot-token");
     await acquired.release();
   });
 

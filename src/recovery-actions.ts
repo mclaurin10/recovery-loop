@@ -88,9 +88,28 @@ export async function continueRecoveryAction(context: Stage9Context): Promise<St
   action = state.recovery.pendingAction;
   if (action === null || state.health.pendingFailure === null) return { stop: null, detail: null };
   if (action.kind === "revert") {
+    const revertFailure = state.health.pendingFailure;
+    if (
+      revertFailure.classification === "infrastructure" &&
+      action.environmentAttempts === 0 &&
+      context.config.prepare !== null
+    ) {
+      const prepared = await runActivePrepare(context, revertFailure.checkId, head);
+      await context.store.update((draft) => {
+        const current = draft.recovery.pendingAction;
+        if (current === null || current.kind !== "revert" || current.resultCommit !== head) {
+          throw new Error("revert action changed during environment prepare");
+        }
+        current.environmentAttempts = 1;
+      }, context.clock().toISOString());
+      if (prepared.classification === "pass") {
+        await runRecoveryChecks(healthOptions(context), head);
+        return { stop: null, detail: null };
+      }
+    }
     return planResetOrStop(
       context,
-      state.health.pendingFailure,
+      revertFailure,
       "clean revert failed complete smoke/deep health",
     );
   }

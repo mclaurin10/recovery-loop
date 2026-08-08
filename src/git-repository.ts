@@ -13,6 +13,15 @@ interface RunGitOptions {
   environment?: NodeJS.ProcessEnv;
   allowFailure?: boolean;
 }
+const UNSAFE_GIT_ENVIRONMENT = new Set([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG_COUNT",
+]);
 export class GitCommandError extends Error {
   readonly args: readonly string[];
   readonly exitCode: number;
@@ -51,7 +60,7 @@ async function runGitAt(
     const child = spawn("git", ["-C", repositoryPath, ...args], {
       shell: false,
       windowsHide: true,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...options.environment },
+      env: gitEnvironment(options.environment),
       stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
     const stdout: Buffer[] = [];
@@ -73,6 +82,33 @@ async function runGitAt(
     });
     if (options.input !== undefined) child.stdin!.end(options.input);
   });
+}
+function gitEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    const upper = name.toUpperCase();
+    if (
+      value !== undefined &&
+      !UNSAFE_GIT_ENVIRONMENT.has(upper) &&
+      !upper.startsWith("GIT_CONFIG_KEY_") &&
+      !upper.startsWith("GIT_CONFIG_VALUE_")
+    ) {
+      environment[name] = value;
+    }
+  }
+  for (const [name, value] of Object.entries(overrides)) {
+    const upper = name.toUpperCase();
+    if (
+      UNSAFE_GIT_ENVIRONMENT.has(upper) ||
+      upper.startsWith("GIT_CONFIG_KEY_") ||
+      upper.startsWith("GIT_CONFIG_VALUE_")
+    ) {
+      throw new Error(`unsafe Git environment override: ${name}`);
+    }
+    if (value !== undefined) environment[name] = value;
+  }
+  environment.GIT_TERMINAL_PROMPT = "0";
+  return environment;
 }
 function normalizeAbsolute(candidate: string): string {
   return path.normalize(path.resolve(candidate));
@@ -347,6 +383,20 @@ export class GitRepository {
         unsafe.push({ path: change.path, kind: "gitlink", oldMode, newMode });
       } else if (modes.includes("120000")) {
         unsafe.push({ path: change.path, kind: "symlink", oldMode, newMode });
+      }
+    }
+    return unsafe;
+  }
+  async unsafeModeChangesBetween(base: string, target: string): Promise<UnsafeModeChange[]> {
+    const unsafe: UnsafeModeChange[] = [];
+    for (const changedPath of await this.changedPathsBetween(base, target)) {
+      const oldMode = await this.modeAt(base, changedPath);
+      const newMode = await this.modeAt(target, changedPath);
+      const modes = [oldMode, newMode];
+      if (modes.includes("160000")) {
+        unsafe.push({ path: changedPath, kind: "gitlink", oldMode, newMode });
+      } else if (modes.includes("120000")) {
+        unsafe.push({ path: changedPath, kind: "symlink", oldMode, newMode });
       }
     }
     return unsafe;
@@ -655,9 +705,13 @@ function checkpointMessage(
     `Recovery-Loop-Kind: ${request.kind}`,
   ].join("\n");
 }
-function isPathWithin(candidate: string, parent: string): boolean {
+export function isPathWithin(candidate: string, parent: string): boolean {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+  return relative === "" || (
+    !path.isAbsolute(relative) &&
+    !relative.startsWith(`..${path.sep}`) &&
+    relative !== ".."
+  );
 }
 export async function canonicalPath(candidate: string): Promise<string> {
   try {

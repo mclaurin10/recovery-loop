@@ -50,6 +50,9 @@ export interface RecoveryConfig {
     networkAccess: false;
   };
 }
+export const MAX_TIMER_MILLISECONDS = 2_147_483_647;
+export const MAX_TIMER_MINUTES = Math.floor(MAX_TIMER_MILLISECONDS / 60_000);
+export const MAX_TIMER_SECONDS = Math.floor(MAX_TIMER_MILLISECONDS / 1_000);
 const CONFIG_PATH = ".recovery-loop/config.json";
 const CHECK_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 const WINDOWS_ABSOLUTE_PATTERN = /^[a-zA-Z]:[\\/]/;
@@ -91,7 +94,7 @@ function validateCommand(value: unknown, valuePath: string, deep: boolean): Comm
   const base = {
     id,
     argv: validateArgv(command.argv, `${valuePath}.argv`),
-    timeoutSeconds: expectPositiveFiniteNumber(command.timeoutSeconds, `${valuePath}.timeoutSeconds`),
+    timeoutSeconds: validateTimerSeconds(command.timeoutSeconds, `${valuePath}.timeoutSeconds`),
   };
   if (deep && command.bisectable !== undefined) {
     return {
@@ -125,7 +128,7 @@ function validatePrepare(value: unknown): PrepareConfig | null {
   expectExactKeys(prepare, "config.prepare", ["argv", "timeoutSeconds", "triggerPaths"]);
   return {
     argv: validateArgv(prepare.argv, "config.prepare.argv"),
-    timeoutSeconds: expectPositiveFiniteNumber(
+    timeoutSeconds: validateTimerSeconds(
       prepare.timeoutSeconds,
       "config.prepare.timeoutSeconds",
     ),
@@ -216,7 +219,7 @@ export function validateConfig(value: unknown): RecoveryConfig {
         deepPolicy.everyCheckpoints,
         "config.deepPolicy.everyCheckpoints",
       ),
-      maxMinutes: expectPositiveInteger(deepPolicy.maxMinutes, "config.deepPolicy.maxMinutes"),
+      maxMinutes: validateTimerMinutes(deepPolicy.maxMinutes, "config.deepPolicy.maxMinutes"),
       changedFileThreshold: expectPositiveInteger(
         deepPolicy.changedFileThreshold,
         "config.deepPolicy.changedFileThreshold",
@@ -240,7 +243,7 @@ export function validateConfig(value: unknown): RecoveryConfig {
     },
     limits: {
       maxAgentTurns: expectPositiveInteger(limits.maxAgentTurns, "config.limits.maxAgentTurns"),
-      maxWallMinutes: expectPositiveInteger(limits.maxWallMinutes, "config.limits.maxWallMinutes"),
+      maxWallMinutes: validateTimerMinutes(limits.maxWallMinutes, "config.limits.maxWallMinutes"),
       maxRepairTurnsPerFailure: expectPositiveInteger(
         limits.maxRepairTurnsPerFailure,
         "config.limits.maxRepairTurnsPerFailure",
@@ -253,7 +256,7 @@ export function validateConfig(value: unknown): RecoveryConfig {
         limits.maxLocalizationCommits,
         "config.limits.maxLocalizationCommits",
       ),
-      agentTurnSeconds: expectPositiveInteger(
+      agentTurnSeconds: validateTimerSecondsInteger(
         limits.agentTurnSeconds,
         "config.limits.agentTurnSeconds",
       ),
@@ -265,6 +268,27 @@ export function validateConfig(value: unknown): RecoveryConfig {
       networkAccess: false,
     },
   };
+}
+function validateTimerSeconds(value: unknown, valuePath: string): number {
+  const seconds = expectPositiveFiniteNumber(value, valuePath);
+  if (Math.round(seconds * 1_000) > MAX_TIMER_MILLISECONDS) {
+    throw new ValidationError(valuePath, `must be at most ${MAX_TIMER_MILLISECONDS / 1_000} seconds`);
+  }
+  return seconds;
+}
+function validateTimerSecondsInteger(value: unknown, valuePath: string): number {
+  const seconds = expectPositiveInteger(value, valuePath);
+  if (seconds > MAX_TIMER_SECONDS) {
+    throw new ValidationError(valuePath, `must be at most ${MAX_TIMER_SECONDS} seconds`);
+  }
+  return seconds;
+}
+function validateTimerMinutes(value: unknown, valuePath: string): number {
+  const minutes = expectPositiveInteger(value, valuePath);
+  if (minutes > MAX_TIMER_MINUTES) {
+    throw new ValidationError(valuePath, `must be at most ${MAX_TIMER_MINUTES} minutes`);
+  }
+  return minutes;
 }
 export async function loadConfig(worktreePath: string): Promise<RecoveryConfig> {
   const configPath = path.join(worktreePath, ...CONFIG_PATH.split("/"));

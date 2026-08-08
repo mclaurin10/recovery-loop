@@ -171,58 +171,81 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
   let exitCode: number | null = null;
   const [executable, ...args] = options.command.argv;
   if (executable === undefined) throw new Error("command argv must not be empty");
-  const child = spawn(executable, args, {
-    cwd: options.repository.repositoryRoot,
-    shell: false,
-    windowsHide: true,
-    detached: process.platform !== "win32",
-    env: sanitizeEnvironment(process.env, options.environment),
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const completion = new Promise<void>((resolve) => {
-    let settled = false;
-    const finish = (): void => {
-      if (!settled) { settled = true; resolve(); }
-    };
-    child.once("error", (error) => { spawnError = error; finish(); });
-    child.once("close", (code, closedSignal) => {
-      exitCode = code;
-      signal = closedSignal;
-      finish();
-    });
-  });
-  child.stdout.on("data", (chunk: Buffer) => stdoutTail.append(chunk));
-  child.stderr.on("data", (chunk: Buffer) => stderrTail.append(chunk));
-  child.stdout.pipe(stdoutStream);
-  child.stderr.pipe(stderrStream);
-  stdoutStream.on("error", (error) => {
-    outputError = error;
-    void terminateProcessTree(child, options.terminationGraceMs ?? 1_000);
-  });
-  stderrStream.on("error", (error) => {
-    outputError = error;
-    void terminateProcessTree(child, options.terminationGraceMs ?? 1_000);
-  });
+  const terminationGraceMs = options.terminationGraceMs ?? 1_000;
+  let child: ChildProcess | null = null;
   try {
-    await options.hooks?.afterSpawn?.(child.pid ?? null);
+    child = spawn(executable, args, {
+      cwd: options.repository.repositoryRoot,
+      shell: false,
+      windowsHide: true,
+      detached: process.platform !== "win32",
+      env: sanitizeEnvironment(process.env, options.environment),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
   } catch (error) {
-    await terminateProcessTree(child, options.terminationGraceMs ?? 1_000);
-    throw error;
+    spawnError = error instanceof Error ? error : new Error(String(error));
   }
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    void terminateProcessTree(child, options.terminationGraceMs ?? 1_000);
-  }, Math.max(1, Math.round(options.command.timeoutSeconds * 1_000)));
-  timeout.unref();
-  await completion;
-  clearTimeout(timeout);
-  const streamResults = await Promise.allSettled([finished(stdoutStream), finished(stderrStream)]);
-  for (const streamResult of streamResults) {
-    if (streamResult.status === "rejected") {
-      outputError =
-        streamResult.reason instanceof Error
-          ? streamResult.reason
-          : new Error(String(streamResult.reason));
+  if (child === null) {
+    stdoutStream.end();
+    stderrStream.end();
+  } else {
+    const spawnedChild = child;
+    const completion = new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (!settled) { settled = true; resolve(); }
+      };
+      spawnedChild.once("error", (error) => { spawnError = error; finish(); });
+      spawnedChild.once("exit", (code, exitedSignal) => {
+        exitCode = code;
+        signal = exitedSignal;
+        finish();
+      });
+    });
+    const childStdout = spawnedChild.stdout;
+    const childStderr = spawnedChild.stderr;
+    if (childStdout === null || childStderr === null) {
+      outputError = new Error("command output pipes were not created");
+      stdoutStream.end();
+      stderrStream.end();
+      await terminateProcessTree(spawnedChild, terminationGraceMs);
+    } else {
+      childStdout.on("data", (chunk: Buffer) => stdoutTail.append(chunk));
+      childStderr.on("data", (chunk: Buffer) => stderrTail.append(chunk));
+      childStdout.pipe(stdoutStream);
+      childStderr.pipe(stderrStream);
+    }
+    stdoutStream.on("error", (error) => {
+      outputError = error;
+      void terminateProcessTree(spawnedChild, terminationGraceMs);
+    });
+    stderrStream.on("error", (error) => {
+      outputError = error;
+      void terminateProcessTree(spawnedChild, terminationGraceMs);
+    });
+    try {
+      await options.hooks?.afterSpawn?.(spawnedChild.pid ?? null);
+    } catch (error) {
+      await terminateProcessTree(spawnedChild, terminationGraceMs);
+      throw error;
+    }
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      void terminateProcessTree(spawnedChild, terminationGraceMs);
+    }, Math.max(1, Math.round(options.command.timeoutSeconds * 1_000)));
+    timeout.unref();
+    await completion;
+    clearTimeout(timeout);
+  }
+  const drained = await drainCommandOutput(child, stdoutStream, stderrStream, terminationGraceMs);
+  if (!drained.forced) {
+    for (const streamResult of drained.results) {
+      if (streamResult.status === "rejected") {
+        outputError =
+          streamResult.reason instanceof Error
+            ? streamResult.reason
+            : new Error(String(streamResult.reason));
+      }
     }
   }
   let worktreeChanged = false;
@@ -463,7 +486,7 @@ function confirmation(
 }
 async function terminateProcessTree(child: ChildProcess, graceMs: number): Promise<void> {
   const pid = child.pid;
-  if (pid === undefined || child.exitCode !== null) return;
+  if (pid === undefined) return;
   if (process.platform === "win32") {
     await new Promise<void>((resolve) => {
       const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
@@ -489,6 +512,40 @@ async function terminateProcessTree(child: ChildProcess, graceMs: number): Promi
     }
   }, graceMs);
   force.unref();
+}
+async function drainCommandOutput(
+  child: ChildProcess | null,
+  stdoutStream: WriteStream,
+  stderrStream: WriteStream,
+  graceMs: number,
+): Promise<{ forced: boolean; results: PromiseSettledResult<void>[] }> {
+  const completion = Promise.allSettled([finished(stdoutStream), finished(stderrStream)]);
+  const completedNormally = await Promise.race([
+    completion.then(() => true),
+    delay(Math.max(1, graceMs)).then(() => false),
+  ]);
+  if (completedNormally) return { forced: false, results: await completion };
+  if (child !== null) {
+    await terminateProcessTree(child, graceMs);
+    child.stdout?.unpipe(stdoutStream);
+    child.stderr?.unpipe(stderrStream);
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  }
+  stdoutStream.end();
+  stderrStream.end();
+  const ended = await Promise.race([
+    completion.then(() => true),
+    delay(Math.max(1, graceMs)).then(() => false),
+  ]);
+  if (!ended) {
+    stdoutStream.destroy();
+    stderrStream.destroy();
+  }
+  return { forced: true, results: await completion };
+}
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 async function restoreTrackedMutation(
   repository: GitRepository,

@@ -116,6 +116,19 @@ describe("validateConfig", () => {
     const checks = nested(timeout, "checks");
     (checks.smoke as Record<string, unknown>[])[0]!.timeoutSeconds = Number.POSITIVE_INFINITY;
     expect(() => validateConfig(timeout)).toThrow("positive finite number");
+
+    const wallOverflow = validConfig();
+    nested(wallOverflow, "limits").maxWallMinutes = 35_792;
+    expect(() => validateConfig(wallOverflow)).toThrow("at most 35791 minutes");
+
+    const turnOverflow = validConfig();
+    nested(turnOverflow, "limits").agentTurnSeconds = 2_147_484;
+    expect(() => validateConfig(turnOverflow)).toThrow("at most 2147483 seconds");
+
+    const commandOverflow = validConfig();
+    const overflowChecks = nested(commandOverflow, "checks");
+    (overflowChecks.smoke as Record<string, unknown>[])[0]!.timeoutSeconds = 2_147_484;
+    expect(() => validateConfig(commandOverflow)).toThrow("at most 2147483.647 seconds");
   });
 
   it("validates optional prepare commands and their trigger paths", () => {

@@ -407,7 +407,11 @@ async function countSessionCheckpoints(
   actualHead: string | null,
 ): Promise<number> {
   if (actualHead === null) return 0;
-  const output = (await repository.git(["log", state.repository.branch, "--format=%B%x00"])).stdout;
+  const output = (await repository.git([
+    "log",
+    `${state.repository.baselineCommit}..${state.repository.branch}`,
+    "--format=%B%x00",
+  ])).stdout;
   const trailer = `Recovery-Loop-Session: ${state.session.id}`;
   return output.split("\0").filter((message) => message.includes(trailer)).length;
 }

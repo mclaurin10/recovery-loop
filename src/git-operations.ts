@@ -10,7 +10,7 @@ import {
   type RevertResult,
   type RollbackResult,
 } from "./git-repository.js";
-import type { StateStore } from "./state-store.js";
+import { isRecordedProcessAlive, type StateStore } from "./state-store.js";
 export interface OperationHooks {
   afterGitMutation?: (kind: PendingOperation["kind"]) => void | Promise<void>;
   afterRescueVerified?: () => void | Promise<void>;
@@ -20,7 +20,11 @@ export interface JournaledCheckpointRequest extends CheckpointRequest {
   hooks?: OperationHooks;
 }
 export interface StartupReconcileOptions {
-  guard?: (repository: GitRepository) => Promise<void>;
+  guard?: (
+    repository: GitRepository,
+    expectedHead?: string,
+    committedBase?: string,
+  ) => Promise<void>;
   hooks?: OperationHooks;
 }
 export type StartupAction =
@@ -237,6 +241,7 @@ export async function reconcileStartup(
     throw new Error("state belongs to a different repository");
   }
   let worktree: GitRepository;
+  let workspaceRecreated = false;
   if (!(await pathExists(state.repository.worktreePath))) {
     const branchHead = await repositoryWithCommonDir.branchHead(state.repository.branch);
     if (
@@ -261,24 +266,16 @@ export async function reconcileStartup(
     ) {
       throw new CanonicalityError(state.repository.baselineCommit, branchHead, "workspace branch moved during init");
     }
-    if (state.phase !== "checkpointing" || state.operation?.kind !== "workspace") {
-      await store.persistIntent(
-        "checkpointing",
-        operation({
-          kind: "workspace",
-          baseCommit: state.repository.expectedHead,
-          targetCommit: state.repository.expectedHead,
-          observedHead: branchHead,
-        }),
-      );
-    }
     worktree = await repositoryWithCommonDir.recreatePersistentWorktree(
       state.repository.branch,
       state.repository.worktreePath,
     );
     await options.hooks?.afterGitMutation?.("workspace");
-    state = await store.finishOperation(branchHead);
-    return { action: "workspace-recreated", state, checkpoint: null };
+    if (state.phase === "checkpointing" && state.operation?.kind === "workspace") {
+      state = await store.finishOperation(branchHead);
+      return { action: "workspace-recreated", state, checkpoint: null };
+    }
+    workspaceRecreated = true;
   }
   worktree = await GitRepository.open(state.repository.worktreePath);
   await store.assertRepositoryIdentity({
@@ -395,7 +392,7 @@ export async function reconcileStartup(
       checkpoint,
     };
   }
-  return { action: "ready", state, checkpoint: null };
+  return { action: workspaceRecreated ? "workspace-recreated" : "ready", state, checkpoint: null };
 }
 async function continueCheckpoint(
   store: StateStore,
@@ -418,6 +415,10 @@ async function continueCheckpoint(
     const count = await repository.commitCount(`${pending.baseCommit}..${actual}`);
     const message = await repository.commitMessage(actual);
     if (count === 1 && operationTrailerMatches(message, state, pending)) {
+      if (options.guard === undefined) {
+        throw new Error("checkpoint adoption requires a configured safety guard");
+      }
+      await options.guard(repository, actual, pending.baseCommit);
       const finished = await store.finishOperation(actual);
       await store.appendEvent({
         type: "checkpoint-created",
@@ -712,10 +713,6 @@ export function interruptedOperation(options: {
 function rejectLiveRecordedCommand(state: RecoveryState): void {
   const pid = state.operation?.kind === "check" ? state.operation.childPid : null;
   if (pid === null) return;
-  try {
-    process.kill(pid, 0);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EPERM") return;
-  }
+  if (!isRecordedProcessAlive(pid, state.operation!.startedAt)) return;
   throw new Error(`recorded command PID ${pid} is still alive; refusing to run a duplicate command`);
 }

@@ -93,6 +93,7 @@ Review the model string against the authenticated Codex environment before initi
 - `goalFile` identifies the one tracked goal file.
 - `branch` must begin with `recovery-loop/`; `recovery-loop/work` is the default.
 - Trigger and protected paths use normalized repository-relative forward-slash paths with no traversal.
+- A protected path ending in `/` protects that directory prefix; without the trailing slash it protects only the file with that exact name. For example, use `docs/` for the directory, not `docs`.
 - The goal file and `.recovery-loop/config.json` are protected even if omitted from `protectedPaths`.
 
 The configured branch must not already exist. The chosen worktree path must not exist and must be outside both the operator checkout and Git common directory. Initialization refuses unrelated existing resources rather than overwriting them.
@@ -109,9 +110,13 @@ Every command is an argument array. Shell strings are invalid.
 }
 ```
 
-Command IDs must be unique across smoke and deep sets. Timeouts must be positive and finite. Commands run sequentially, without a shell, in the autonomous worktree, and communicate health through process exit status.
+Command IDs must be unique across smoke and deep sets. Timeouts must be positive, finite, and no greater than 2,147,483.647 seconds. Commands run sequentially, without an implicit shell, in the autonomous worktree, and communicate health through process exit status.
+
+On Windows, package-manager commands such as `pnpm`, `npm`, and `yarn` are commonly installed as `.cmd` shims. Modern Node.js does not execute those shims directly with `shell: false`. Configure an executable wrapper explicitly, for example `["node", "node_modules/typescript/bin/tsc", "--noEmit"]`, or use an intentional Windows command wrapper such as `["cmd.exe", "/d", "/s", "/c", "pnpm", "typecheck"]`. Review any `cmd.exe` wrapper as a shell command and do not interpolate agent-controlled text. A command that cannot start is recorded as an infrastructure result rather than crashing the controller.
 
 Recovery Loop captures complete stdout/stderr in local session logs, retains bounded redacted tails for diagnosis, enforces the configured timeout, and verifies that tracked source did not change. Ignored build output is allowed; tracked mutation makes the result invalid and is removed from the checked worktree.
+
+An elapsed command timeout is classified as infrastructure evidence. Recovery Loop cannot reliably distinguish an agent-introduced infinite loop from a stalled tool or environment at this boundary, so choose timeouts and check granularity with that limitation in mind.
 
 Project commands are trusted operator configuration. They must:
 
@@ -175,7 +180,9 @@ Keep smoke cheap enough for every checkpoint and deep meaningful enough to estab
 - `maxLocalizationCommits`: maximum first-parent search range.
 - `agentTurnSeconds`: timeout for one SDK coding turn.
 
-`recovery-loop run` may impose lower invocation-specific limits with `--max-agent-turns`, `--max-checkpoints`, and `--max-minutes`. It cannot use those flags to exceed tracked policy limits.
+Timer-backed limits are capped to Node.js's safe timer range: `maxWallMinutes` and deep `maxMinutes` may not exceed 35,791, and `agentTurnSeconds` may not exceed 2,147,483.
+
+`recovery-loop run` may impose lower limits on the current durable session with `--max-agent-turns`, `--max-checkpoints`, and `--max-minutes`. After a hard crash, the resumed run continues measuring the same session counters and original session start time. The flags cannot exceed tracked policy limits.
 
 ### Agent settings
 

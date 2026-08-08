@@ -237,7 +237,7 @@ async function buildPrompt(request: AgentInvocation, freshReason: ThreadRotation
   const state = await request.store.readState();
   const goal = await readFile(path.join(state.repository.worktreePath, ...request.config.goalFile.split("/")), "utf8");
   const commits = (await request.repository.git(["log", "-8", "--format=%H%x09%s"])).stdout.trim();
-  const events = (await request.store.readEvents()).events.slice(-8).map((event) => ({
+  const events = (await request.store.readRecentEvents(8)).map((event) => ({
     sequence: event.sequence, type: event.type, headCommit: event.headCommit, data: event.data,
   }));
   const context = {

@@ -63,11 +63,21 @@ export async function ensureLocalizedFailure(
   if (failure.localization?.status === "localized" || failure.localization?.status === "window") {
     return { stop: null, detail: null };
   }
-  if (failure.localization?.status === "anchor-failed") {
-    return { stop: "recovery-infrastructure", detail: failure.localization.reason };
-  }
-  if (failure.localization?.status === "aborted") {
-    return stoppedLocalization(failure.localization.reason);
+  if (
+    failure.localization?.status === "anchor-failed" ||
+    failure.localization?.status === "aborted"
+  ) {
+    const reason = failure.localization.reason ?? "localization previously stopped on uncertain evidence";
+    if (reason.startsWith("safety:")) return { stop: "recovery-safety", detail: reason };
+    await context.store.update((draft) => {
+      const localization = requireLocalization(draft, failure.id);
+      localization.status = "window";
+      localization.reason = `retained after prior localization stop: ${reason}`;
+      const current = requireFailure(draft, failure.id);
+      current.firstBadCommit = null;
+      current.regressionWindow = [localization.lowerCommit, localization.upperCommit];
+    }, context.clock().toISOString());
+    return { stop: null, detail: null };
   }
   const knownGood = failure.knownGoodCommit;
   if (knownGood === null) return { stop: null, detail: null };
@@ -117,7 +127,7 @@ export async function ensureLocalizedFailure(
     );
   }
 
-  const anchor = await observeCandidate(context, failure.id, "anchor", knownGood, "pass");
+  const anchor = await observeCandidate(context, failure.id, "anchor", knownGood);
   if (anchor === "fail") {
     await context.store.update((draft) => {
       const localization = requireLocalization(draft, failure.id);
@@ -136,7 +146,7 @@ export async function ensureLocalizedFailure(
   }
   if (anchor !== "pass") return abortForVerdict(context, failure.id, head, "anchor", anchor);
 
-  const headVerdict = await observeCandidate(context, failure.id, "head", head, "fail");
+  const headVerdict = await observeCandidate(context, failure.id, "head", head);
   if (headVerdict !== "fail") {
     const verdict = headVerdict === "pass" ? "flaky" : headVerdict;
     return abortForVerdict(context, failure.id, head, "head", verdict);
@@ -176,7 +186,7 @@ export async function ensureLocalizedFailure(
     const midpointIndex = Math.floor((lowerIndex + upperIndex) / 2);
     const midpoint = chain[midpointIndex];
     if (midpoint === undefined) throw new Error("localization midpoint is missing");
-    const verdict = await observeCandidate(context, failure.id, "midpoint", midpoint, null);
+    const verdict = await observeCandidate(context, failure.id, "midpoint", midpoint);
     if (verdict === "pass") {
       lower = midpoint;
       lowerIndex = midpointIndex;
@@ -237,7 +247,6 @@ async function observeCandidate(
   failureId: string,
   role: LocalizationRole,
   commit: string,
-  expectation: "pass" | "fail" | null,
 ): Promise<LocalizationVerdict> {
   await ensureObservation(context, failureId, role, commit);
   let observation = requireObservation(await context.store.readState(), failureId, role, commit);
@@ -273,10 +282,6 @@ async function observeCandidate(
   if (firstBoundary !== null) {
     await persistVerdict(context, failureId, role, commit, firstBoundary);
     return firstBoundary;
-  }
-  if (attempts[0]?.classification === "pass" && expectation !== "fail") {
-    await persistVerdict(context, failureId, role, commit, "pass");
-    return "pass";
   }
   while (attempts.length < 3) {
     const consensus = productConsensus(attempts);
@@ -494,13 +499,6 @@ async function abortLocalization(
     data: { failureId, reason, regressionWindow: window },
   });
   return { stop, detail: reason };
-}
-
-function stoppedLocalization(reason: string | null): Stage9Result {
-  const detail = reason ?? "localization previously aborted on uncertain evidence";
-  if (detail.startsWith("safety:")) return { stop: "recovery-safety", detail };
-  if (detail.startsWith("infrastructure:")) return { stop: "recovery-infrastructure", detail };
-  return { stop: "recovery-flaky", detail };
 }
 
 function configuredCommand(config: RecoveryConfig, checkId: string): CommandSpec {

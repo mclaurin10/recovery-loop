@@ -57,7 +57,7 @@ When the authority files already exist, `init`:
 4. takes the mutating `init` lock;
 5. calls the existing journaled workspace initializer;
 6. creates only the configured `recovery-loop/` branch and linked worktree;
-7. records an initialization session event;
+7. records and finishes a distinct initialization session;
 8. runs configured prepare when present;
 9. runs complete baseline smoke and deep sets through the existing journaled check runner;
 10. reports the baseline, worktree, known-good anchor, and any pending failure.

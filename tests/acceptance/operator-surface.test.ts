@@ -36,6 +36,14 @@ describe("Stage 10 operator surface", () => {
       kind: "scaffolded",
       created: ["RECOVERY_GOAL.md", ".recovery-loop/config.json"],
     });
+    const generated = JSON.parse(
+      await readFile(path.join(test.projectPath, ".recovery-loop", "config.json"), "utf8"),
+    ) as { checks: { smoke: Array<{ argv: string[] }>; deep: Array<{ argv: string[] }> } };
+    const expectedPrefix = process.platform === "win32"
+      ? ["cmd.exe", "/d", "/s", "/c", "pnpm"]
+      : ["pnpm"];
+    expect(generated.checks.smoke[0]?.argv.slice(0, expectedPrefix.length)).toEqual(expectedPrefix);
+    expect(generated.checks.deep[0]?.argv.slice(0, expectedPrefix.length)).toEqual(expectedPrefix);
     expect(await test.repository.branchHead("recovery-loop/work")).toBeNull();
     await expect(access(path.join(test.repository.gitCommonDir, "recovery-loop", "state.json")))
       .rejects.toThrow();
@@ -57,6 +65,10 @@ describe("Stage 10 operator surface", () => {
     expect(await test.repository.head()).toBe(operatorHead);
 
     const store = new StateStore(test.repository.gitCommonDir);
+    await store.update((draft) => {
+      draft.session.startedAt = "2026-08-07T20:00:00.000Z";
+      draft.session.finishedAt = "2026-08-07T20:00:05.000Z";
+    });
     const stateBefore = await readFile(store.statePath, "utf8");
     const namesBefore = await readdir(store.runtimeRoot);
     const status = await readStatusSnapshot(test.projectPath);
@@ -71,7 +83,11 @@ describe("Stage 10 operator surface", () => {
       lastSmoke: { commit: operatorHead, completeSetPassed: true },
       lastDeep: { commit: operatorHead, completeSetPassed: true },
       pendingFailure: null,
+      sessionStatus: "stopped",
+      stopReason: "initialized",
+      phase: "stopped",
       lock: { status: "none" },
+      usage: { sessionElapsedMilliseconds: 5_000 },
     });
     expect(renderStatus(status)).toContain("current head (autonomous branch tip; may be unhealthy)");
     expect(renderStatus(status)).toContain("known-good anchor (last complete smoke+deep pass)");

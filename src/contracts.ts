@@ -249,6 +249,7 @@ export interface RecoveryState {
   session: {
     id: string;
     startedAt: string;
+    finishedAt: string | null;
     status: "running" | "stopped";
     stopReason: string | null;
   };
@@ -637,7 +638,12 @@ export function validateRecoveryState(value: unknown): RecoveryState {
     "expectedHead",
   ]);
   const session = expectObject(state.session, "state.session");
-  expectExactKeys(session, "state.session", ["id", "startedAt", "status", "stopReason"]);
+  expectExactKeys(
+    session,
+    "state.session",
+    ["id", "startedAt", "status", "stopReason"],
+    ["finishedAt"],
+  );
   const agent = expectObject(state.agent, "state.agent");
   expectExactKeys(agent, "state.agent", [
     "threadId",
@@ -707,6 +713,9 @@ export function validateRecoveryState(value: unknown): RecoveryState {
     session: {
       id: expectNonEmptyString(session.id, "state.session.id"),
       startedAt: expectIsoDate(session.startedAt, "state.session.startedAt"),
+      finishedAt: session.finishedAt === undefined || session.finishedAt === null
+        ? null
+        : expectIsoDate(session.finishedAt, "state.session.finishedAt"),
       status: expectEnum(session.status, "state.session.status", ["running", "stopped"] as const),
       stopReason: expectNullableString(session.stopReason, "state.session.stopReason"),
     },
@@ -800,6 +809,7 @@ export function createInitialState(options: InitialStateOptions): RecoveryState 
     session: {
       id: options.sessionId,
       startedAt: now,
+      finishedAt: null,
       status: "running",
       stopReason: null,
     },

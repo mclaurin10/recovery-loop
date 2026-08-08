@@ -183,6 +183,12 @@ async function planResetOrStop(
   failure: PendingFailure,
   reason: string,
 ): Promise<Stage9Result> {
+  if (failure.localization?.status === "anchor-failed") {
+    return {
+      stop: "repair-exhausted",
+      detail: `${reason}; the previous known-good anchor failed historical validation, so rollback is unavailable`,
+    };
+  }
   const target = failure.knownGoodCommit;
   if (target === null) {
     return {

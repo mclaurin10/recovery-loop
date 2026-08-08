@@ -318,7 +318,11 @@ export async function scaffoldContract(repositoryPath: string): Promise<Scaffold
     const destination = path.join(repositoryPath, ...target.relative.split("/"));
     await mkdir(path.dirname(destination), { recursive: true });
     try {
-      await writeFile(destination, await readFile(path.join(templateRoot, target.template)), {
+      const template = await readFile(path.join(templateRoot, target.template), "utf8");
+      const contents = target.relative === CONFIG_PATH
+        ? platformConfigTemplate(template)
+        : template;
+      await writeFile(destination, contents, {
         flag: "wx",
         mode: 0o600,
       });
@@ -328,4 +332,34 @@ export async function scaffoldContract(repositoryPath: string): Promise<Scaffold
     }
   }
   return { created };
+}
+function platformConfigTemplate(template: string): string {
+  if (process.platform !== "win32") return template;
+  const config = validateConfig(JSON.parse(template));
+  const wrap = (argv: readonly string[]): readonly string[] => {
+    const executable = argv[0]?.toLowerCase();
+    if (
+      executable === undefined ||
+      !["pnpm", "npm", "npx", "yarn", "yarnpkg"].includes(executable)
+    ) {
+      return argv;
+    }
+    return ["cmd.exe", "/d", "/s", "/c", ...argv];
+  };
+  return `${JSON.stringify({
+    ...config,
+    prepare: config.prepare === null
+      ? null
+      : { ...config.prepare, argv: wrap(config.prepare.argv) },
+    checks: {
+      smoke: config.checks.smoke.map((command) => ({
+        ...command,
+        argv: wrap(command.argv),
+      })),
+      deep: config.checks.deep.map((command) => ({
+        ...command,
+        argv: wrap(command.argv),
+      })),
+    },
+  }, null, 2)}\n`;
 }

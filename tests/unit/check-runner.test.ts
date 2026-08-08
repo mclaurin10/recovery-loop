@@ -230,6 +230,26 @@ describe("bounded argv-only command execution", () => {
     expect(patchContents).toContain("mutated by check");
   });
 
+  it("classifies and removes nonignored untracked output created by a check", async () => {
+    const { fixture, worktree, logRoot } = await checkedFixture();
+    const generated = path.join(fixture.worktreePath, "generated-by-check.txt");
+    const result = await runCommand({
+      repository: worktree,
+      command: nodeCommand(
+        "untracked-output",
+        'require("node:fs").writeFileSync("generated-by-check.txt", "generated\\n")',
+      ),
+      commit: fixture.baseline,
+      category: "smoke",
+      logRoot,
+      sequence: 1,
+    });
+    expect(result).toMatchObject({ classification: "infrastructure", worktreeChanged: true });
+    expect(result.error).toContain("nonignored untracked output");
+    await expect(access(generated)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await worktree.changedPaths(true)).toEqual([]);
+  });
+
   it("allows ignored generated output and keeps checks bound to exact HEAD", async () => {
     const { fixture, worktree, logRoot } = await checkedFixture();
     await fixture.write(fixture.worktreePath, ".gitignore", "ignored.tmp\n");

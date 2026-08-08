@@ -84,7 +84,14 @@ async function run(test: Stage9Fixture, steps: readonly ScriptedAgentStep[]) {
     store: test.store,
     gateway: new CodexAgentGateway(sdk),
   });
-  sdk.assertFinished();
+  try {
+    sdk.assertFinished();
+  } catch (error) {
+    throw new Error(
+      `${(error as Error).message}; stop=${String(result.summary.stopReason)}; ` +
+      `detail=${String(result.summary.stopDetail)}; pending=${JSON.stringify(result.summary.pendingFailure)}`,
+    );
+  }
   return { result, sdk };
 }
 
@@ -181,6 +188,7 @@ describe("Stage 9 delayed localization", () => {
           `process.exit(require("node:fs").existsSync(${JSON.stringify(drift)})?7:0)`] }];
       config.deepPolicy.everyCheckpoints = 1;
       config.prepare = null;
+      config.limits.maxRepairTurnsPerFailure = 1;
     });
     const drift = path.join(test.fixture.root, "environment-drift.txt");
     const { result, sdk } = await run(test, [{
@@ -200,6 +208,20 @@ describe("Stage 9 delayed localization", () => {
     expect((await test.store.readEvents()).events.some((event) =>
       event.type === "regression-localized")).toBe(false);
     expect(sdk.calls).toHaveLength(1);
+
+    const failedHead = state.repository.expectedHead;
+    const resumed = await run(test, [{
+      method: "resume",
+      response: response("no_change", "external drift cannot be repaired in source"),
+    }]);
+    const afterResume = await test.store.readState();
+    expect(resumed.result.summary).toMatchObject({
+      stopReason: "repair-exhausted",
+      hardRollbacks: 0,
+    });
+    expect(afterResume.repository.expectedHead).toBe(failedHead);
+    expect(afterResume.recovery.rescueRefs).toEqual([]);
+    expect(afterResume.health.pendingFailure?.localization?.status).toBe("anchor-failed");
   }, 90_000);
 
   it("aborts on a flaky midpoint and preserves the smallest proven window", async () => {
@@ -234,6 +256,10 @@ describe("Stage 9 delayed localization", () => {
     });
     expect(state.health.pendingFailure?.localization?.reason).toContain("midpoint");
     expect(state.health.pendingFailure?.regressionWindow).not.toBeNull();
+    const anchor = state.health.pendingFailure?.localization?.observations.find(
+      (observation) => observation.role === "anchor",
+    );
+    expect(anchor?.attempts).toHaveLength(1);
     expect(sdk.calls).toHaveLength(5);
   }, 90_000);
 

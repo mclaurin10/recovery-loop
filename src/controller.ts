@@ -307,7 +307,8 @@ async function checkpointGuard(
 async function stopSession(operator: GitRepository, store: StateStore, reason: RunStopReason, detail: string | null, clock: () => Date): Promise<RunControllerResult> {
   const finishedAt = clock().toISOString();
   await store.update((draft) => {
-    draft.phase = "stopped"; draft.operation = null; draft.session.status = "stopped"; draft.session.stopReason = reason;
+    draft.phase = "stopped"; draft.operation = null; draft.session.status = "stopped";
+    draft.session.finishedAt = finishedAt; draft.session.stopReason = reason;
   }, finishedAt);
   let state = await store.readState();
   const finalCommit = await operator.branchHead(state.repository.branch) ?? state.repository.expectedHead;
@@ -370,7 +371,13 @@ async function stopSession(operator: GitRepository, store: StateStore, reason: R
 async function beginNewSession(store: StateStore, previous: RecoveryState, now: Date): Promise<RecoveryState> {
   const timestamp = now.toISOString();
   return store.update((draft) => {
-    draft.session = { id: sessionId(now), startedAt: timestamp, status: "running", stopReason: null };
+    draft.session = {
+      id: sessionId(now),
+      startedAt: timestamp,
+      finishedAt: null,
+      status: "running",
+      stopReason: null,
+    };
     if (previous.phase === "stopped") {
       draft.phase = "idle";
       draft.operation = null;

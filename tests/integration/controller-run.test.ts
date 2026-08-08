@@ -6,6 +6,7 @@ import { loadConfig } from "../../src/config.js";
 import { checkBaseline, runNormalController } from "../../src/controller.js";
 import { initializeJournaledWorkspace } from "../../src/git-operations.js";
 import type { GitRepository } from "../../src/git-repository.js";
+import { initializeRepository } from "../../src/operator-surface.js";
 import { StateStore } from "../../src/state-store.js";
 import { ScriptedAgentSdk, type ScriptedAgentStep } from "../support/scripted-agent.js";
 import { createTemporaryRepository, type TemporaryRepository } from "../support/temporary-repository.js";
@@ -209,6 +210,32 @@ describe("Stage 7 bounded stops and interruption", () => {
     });
     sdk.assertFinished();
     expect(result.summary).toMatchObject({ stopReason: "max-wall-time", agentTurns: 0 });
+  });
+
+  it("starts a fresh bounded session after successful initialization", async () => {
+    const created = await fixture();
+    await initializeRepository(created.projectPath, { worktree: created.worktreePath });
+    const store = new StateStore(created.repository.gitCommonDir);
+    const initialized = await store.readState();
+    expect(initialized.session.status).toBe("stopped");
+    expect(initialized.session.finishedAt).not.toBeNull();
+    const runNow = new Date(Date.parse(initialized.session.startedAt) + 7 * 60 * 60 * 1_000);
+    const sdk = new ScriptedAgentSdk([{
+      method: "start",
+      response: response("goal_complete", "initialized baseline is complete"),
+    }]);
+
+    const result = await runNormalController({
+      repository: created.repository,
+      store,
+      gateway: new CodexAgentGateway(sdk),
+      clock: () => runNow,
+    });
+    sdk.assertFinished();
+    const after = await store.readState();
+    expect(result.summary).toMatchObject({ stopReason: "goal-candidate-ready", agentTurns: 1 });
+    expect(after.session.id).not.toBe(initialized.session.id);
+    expect(after.session.startedAt).toBe(runNow.toISOString());
   });
 
   it("stops after two useful-work misses and resets the streak after a checkpoint", async () => {

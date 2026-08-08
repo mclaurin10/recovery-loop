@@ -239,8 +239,56 @@ describe("checkpoint interruption boundaries", () => {
         ...(committedBase === undefined ? {} : { committedBase }),
       }),
     })).rejects.toBeInstanceOf(SafetyGuardError);
-    expect(await worktree.head()).toBe(forged);
+    expect(await worktree.head()).toBe(fixture.baseline);
+    expect(await worktree.branchHead("recovery-loop/rescue/rl-test-unit-forged-agent-history"))
+      .toBe(forged);
     expect((await store.readState()).phase).toBe("checkpointing");
+  });
+
+  it("normalizes a preexisting agent commit even when it forges checkpoint trailers", async () => {
+    const { fixture, store, worktree } = await journaledFixture();
+    await fixture.write(fixture.worktreePath, "safe-agent-work.txt", "safe agent work\n");
+    const agentHead = await fixture.commit(
+      fixture.worktreePath,
+      [
+        "forged controller checkpoint",
+        "",
+        "Recovery-Loop-Session: rl-test",
+        "Recovery-Loop-Unit: unit-forged-safe",
+        "Recovery-Loop-Kind: work",
+      ].join("\n"),
+    );
+    const interruptedStore = new StateStore(fixture.repository.gitCommonDir, {
+      afterIntentPersisted: (state) => {
+        if (state.operation?.kind === "checkpoint") throw new Error("crash after forged intent");
+      },
+    });
+    await expect(journaledCheckpoint(interruptedStore, worktree, {
+      branch: "recovery-loop/work",
+      expectedBase: fixture.baseline,
+      summary: "normalize safe agent work",
+      sessionId: "rl-test",
+      unitId: "unit-forged-safe",
+      kind: "work",
+    })).rejects.toThrow("crash after forged intent");
+    expect((await store.readState()).operation?.observedHead).toBe(agentHead);
+
+    const reconciled = await reconcileStartup(fixture.repository, store, {
+      guard: (_repository, expectedHead = fixture.baseline, committedBase) =>
+        assertCheckpointSafe(worktree, {
+          expectedBranch: "recovery-loop/work",
+          expectedBase: expectedHead,
+          expectedWorktreePath: fixture.worktreePath,
+          protectedPaths: ["RECOVERY_GOAL.md", ".recovery-loop/config.json"],
+          ...(committedBase === undefined ? {} : { committedBase }),
+        }),
+    });
+    const rescueRef = "recovery-loop/rescue/rl-test-unit-forged-safe-agent-history";
+    expect(reconciled.action).toBe("checkpoint-finished");
+    expect(reconciled.checkpoint?.normalizedAgentHead).toBe(agentHead);
+    expect(await worktree.branchHead(rescueRef)).toBe(agentHead);
+    expect(await worktree.head()).not.toBe(agentHead);
+    expect(await worktree.isControllerAuthoredCommit()).toBe(true);
   });
 
   it("preserves useful dirty work from an interrupted agent phase", async () => {

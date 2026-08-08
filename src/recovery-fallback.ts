@@ -63,10 +63,10 @@ export async function ensureLocalizedFailure(
   if (failure.localization?.status === "localized" || failure.localization?.status === "window") {
     return { stop: null, detail: null };
   }
-  if (
-    failure.localization?.status === "anchor-failed" ||
-    failure.localization?.status === "aborted"
-  ) {
+  if (failure.localization?.status === "anchor-failed") {
+    return { stop: null, detail: null };
+  }
+  if (failure.localization?.status === "aborted") {
     const reason = failure.localization.reason ?? "localization previously stopped on uncertain evidence";
     if (reason.startsWith("safety:")) return { stop: "recovery-safety", detail: reason };
     await context.store.update((draft) => {
@@ -550,7 +550,10 @@ function boundaryVerdict(classification: CommandResult["classification"]): Local
 function productConsensus(results: readonly CommandResult[]): "pass" | "fail" | "flaky" | null {
   const passes = results.filter((result) => result.classification === "pass").length;
   const failures = results.filter((result) => result.classification === "product").length;
-  if (passes >= 2) return failures > 0 ? "flaky" : "pass";
+  if (passes > 0) {
+    if (failures === 0) return "pass";
+    return results.length >= 3 ? "flaky" : null;
+  }
   const groups = new Map<string, number>();
   for (const result of results) {
     if (result.classification !== "product") continue;

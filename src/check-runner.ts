@@ -37,6 +37,7 @@ export interface RunCommandOptions {
   environment?: NodeJS.ProcessEnv;
   maximumTailBytes?: number;
   terminationGraceMs?: number;
+  allowNewUntracked?: boolean;
   hooks?: CommandRunnerHooks;
 }
 export interface ConfirmationResult {
@@ -91,6 +92,9 @@ export function sanitizeEnvironment(
   return sanitized;
 }
 export async function runCommand(options: RunCommandOptions): Promise<CommandResult> {
+  if (options.allowNewUntracked === true && options.category !== "prepare") {
+    throw new Error("only a prepare command may allow new untracked output");
+  }
   const started = Date.now();
   const startedAt = new Date(started).toISOString();
   const commandDirectory = path.join(
@@ -249,23 +253,44 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
     }
   }
   let worktreeChanged = false;
-  let mutationError: string | null = null;
+  const mutationErrors: string[] = [];
   const headAfter = await options.repository.head();
   if (headAfter !== options.commit) {
     worktreeChanged = true;
-    mutationError = `check moved HEAD from ${options.commit} to ${headAfter}; manual canonicality recovery is required`;
-  } else if (await options.repository.hasTrackedChanges()) {
-    worktreeChanged = true;
-    const patchPath = path.join(commandDirectory, "tracked-mutation.patch");
-    try {
-      const mutation = (await options.repository.git(["diff", "--binary", options.commit])).stdout;
-      await writeFile(patchPath, mutation, { encoding: "utf8", mode: 0o600 });
-      await restoreTrackedMutation(options.repository, options.commit, preexistingUntracked);
-      mutationError = `check altered tracked source; patch saved at ${patchPath}`;
-    } catch (error) {
-      mutationError = `check altered tracked source and cleanup failed: ${errorMessage(error)}`;
+    mutationErrors.push(
+      `check moved HEAD from ${options.commit} to ${headAfter}; manual canonicality recovery is required`,
+    );
+  } else {
+    if (await options.repository.hasTrackedChanges()) {
+      worktreeChanged = true;
+      const patchPath = path.join(commandDirectory, "tracked-mutation.patch");
+      try {
+        const mutation = (await options.repository.git(["diff", "--binary", options.commit])).stdout;
+        await writeFile(patchPath, mutation, { encoding: "utf8", mode: 0o600 });
+        await restoreTrackedMutation(options.repository, options.commit, preexistingUntracked);
+        mutationErrors.push(`check altered tracked source; patch saved at ${patchPath}`);
+      } catch (error) {
+        mutationErrors.push(`check altered tracked source and cleanup failed: ${errorMessage(error)}`);
+      }
+    }
+    if (options.allowNewUntracked !== true) {
+      const generated = await newUntrackedPaths(options.repository, preexistingUntracked);
+      if (generated.length > 0) {
+        worktreeChanged = true;
+        try {
+          await removeUntrackedPaths(options.repository, generated);
+          mutationErrors.push(
+            `check created nonignored untracked output; removed: ${generated.join(", ")}`,
+          );
+        } catch (error) {
+          mutationErrors.push(
+            `check created nonignored untracked output and cleanup failed: ${errorMessage(error)}`,
+          );
+        }
+      }
     }
   }
+  const mutationError = mutationErrors.length === 0 ? null : mutationErrors.join("; ");
   let classification: CommandClassification;
   let error: string | null = null;
   if (mutationError !== null) {
@@ -347,6 +372,10 @@ export async function runJournaledCommandSet(options: {
 }): Promise<CommandResult[]> {
   const state = await options.store.readState();
   const activeHead = options.activeHead ?? options.commit;
+  const historicalWorktree = !pathsEqual(
+    options.repository.repositoryRoot,
+    state.repository.worktreePath,
+  );
   if (state.repository.expectedHead !== activeHead) {
     throw new Error(
       `active head ${activeHead} does not match durable expected head ${state.repository.expectedHead}`,
@@ -387,6 +416,9 @@ export async function runJournaledCommandSet(options: {
       logRoot: options.logRoot,
       sequence: options.sequenceStart + index,
       ...(options.environment === undefined ? {} : { environment: options.environment }),
+      ...(historicalWorktree && options.category === "prepare"
+        ? { allowNewUntracked: true }
+        : {}),
       hooks: {
         afterSpawn: async (pid) => {
           await options.store.update((draft) => {
@@ -547,6 +579,11 @@ async function drainCommandOutput(
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
+function pathsEqual(left: string, right: string): boolean {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
 async function restoreTrackedMutation(
   repository: GitRepository,
   commit: string,
@@ -570,6 +607,36 @@ async function restoreTrackedMutation(
   }
   if (await repository.hasTrackedChanges()) {
     throw new Error("tracked source remained dirty after command cleanup");
+  }
+}
+async function newUntrackedPaths(
+  repository: GitRepository,
+  preexistingUntracked: ReadonlySet<string>,
+): Promise<string[]> {
+  return (await repository.changedPaths(true))
+    .filter((change) => !change.tracked && !preexistingUntracked.has(change.path))
+    .map((change) => change.path);
+}
+async function removeUntrackedPaths(
+  repository: GitRepository,
+  paths: readonly string[],
+): Promise<void> {
+  for (const changedPath of paths) {
+    const absolute = path.join(repository.repositoryRoot, ...changedPath.split("/"));
+    try {
+      const metadata = await lstat(absolute);
+      if (!metadata.isFile() && !metadata.isSymbolicLink()) {
+        throw new Error(`refusing to remove non-file check output: ${changedPath}`);
+      }
+      await rm(absolute, { force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  const remaining = await newUntrackedPaths(repository, new Set());
+  const failed = remaining.filter((changedPath) => paths.includes(changedPath));
+  if (failed.length > 0) {
+    throw new Error(`untracked check output remained after cleanup: ${failed.join(", ")}`);
   }
 }
 interface ResultParts {

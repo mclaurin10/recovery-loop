@@ -35,7 +35,7 @@ The agent may not edit the goal. A protected-authority change is rejected before
 
 The generated `.recovery-loop/config.json` is valid JSON with schema version 1. Unknown top-level fields fail validation so misspellings do not silently change policy.
 
-The generated file is the canonical complete example:
+The generated file is the canonical complete example. On Windows, scaffolding expands the package-manager commands below into the explicit `cmd.exe` wrapper described after the example:
 
 ```json
 {
@@ -112,9 +112,9 @@ Every command is an argument array. Shell strings are invalid.
 
 Command IDs must be unique across smoke and deep sets. Timeouts must be positive, finite, and no greater than 2,147,483.647 seconds. Commands run sequentially, without an implicit shell, in the autonomous worktree, and communicate health through process exit status.
 
-On Windows, package-manager commands such as `pnpm`, `npm`, and `yarn` are commonly installed as `.cmd` shims. Modern Node.js does not execute those shims directly with `shell: false`. Configure an executable wrapper explicitly, for example `["node", "node_modules/typescript/bin/tsc", "--noEmit"]`, or use an intentional Windows command wrapper such as `["cmd.exe", "/d", "/s", "/c", "pnpm", "typecheck"]`. Review any `cmd.exe` wrapper as a shell command and do not interpolate agent-controlled text. A command that cannot start is recorded as an infrastructure result rather than crashing the controller.
+On Windows, package-manager commands such as `pnpm`, `npm`, and `yarn` are commonly installed as `.cmd` shims. Modern Node.js does not execute those shims directly with `shell: false`, so Windows scaffolding writes an intentional wrapper such as `["cmd.exe", "/d", "/s", "/c", "pnpm", "typecheck"]`. Review any `cmd.exe` wrapper as a shell command and do not interpolate agent-controlled text. Cross-platform repositories may instead configure an executable Node wrapper such as `["node", "node_modules/typescript/bin/tsc", "--noEmit"]`. A command that cannot start is recorded as an infrastructure result rather than crashing the controller.
 
-Recovery Loop captures complete stdout/stderr in local session logs, retains bounded redacted tails for diagnosis, enforces the configured timeout, and verifies that tracked source did not change. Ignored build output is allowed; tracked mutation makes the result invalid and is removed from the checked worktree.
+Recovery Loop captures complete stdout/stderr in local session logs, retains bounded redacted tails for diagnosis, enforces the configured timeout, and verifies that the check did not alter source state. Ignored build output is allowed. Tracked mutation or newly created nonignored untracked output makes the result invalid and is removed from the checked worktree. Historical prepare commands may create nonignored environment material only in their isolated diagnostic worktree; that worktree is cleaned before the next candidate and is never checkpointed.
 
 An elapsed command timeout is classified as infrastructure evidence. Recovery Loop cannot reliably distinguish an agent-introduced infinite loop from a stalled tool or environment at this boundary, so choose timeouts and check granularity with that limitation in mind.
 
@@ -182,7 +182,7 @@ Keep smoke cheap enough for every checkpoint and deep meaningful enough to estab
 
 Timer-backed limits are capped to Node.js's safe timer range: `maxWallMinutes` and deep `maxMinutes` may not exceed 35,791, and `agentTurnSeconds` may not exceed 2,147,483.
 
-`recovery-loop run` may impose lower limits on the current durable session with `--max-agent-turns`, `--max-checkpoints`, and `--max-minutes`. After a hard crash, the resumed run continues measuring the same session counters and original session start time. The flags cannot exceed tracked policy limits.
+`recovery-loop init` finishes its initialization session after baseline checks, so the first `run` always receives a fresh wall-time and turn budget. `recovery-loop run` may impose lower limits on the current durable run session with `--max-agent-turns`, `--max-checkpoints`, and `--max-minutes`. After a hard crash, the resumed run continues measuring the same session counters and original session start time. The flags cannot exceed tracked policy limits.
 
 ### Agent settings
 

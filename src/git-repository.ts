@@ -254,6 +254,16 @@ export class GitRepository {
   async commitMessage(commit = "HEAD"): Promise<string> {
     return (await this.git(["show", "-s", "--format=%B", commit])).stdout;
   }
+  async isControllerAuthoredCommit(commit = "HEAD"): Promise<boolean> {
+    const identity = (
+      await this.git(["show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", commit])
+    ).stdout.trimEnd().split("\0");
+    return identity.length === 4 &&
+      identity[0] === CONTROLLER_ENVIRONMENT.GIT_AUTHOR_NAME &&
+      identity[1] === CONTROLLER_ENVIRONMENT.GIT_AUTHOR_EMAIL &&
+      identity[2] === CONTROLLER_ENVIRONMENT.GIT_COMMITTER_NAME &&
+      identity[3] === CONTROLLER_ENVIRONMENT.GIT_COMMITTER_EMAIL;
+  }
   async ensureClean(includeUntracked = true): Promise<void> {
     const changes = await this.changedPaths(includeUntracked);
     if (changes.length > 0) {

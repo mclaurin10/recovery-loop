@@ -17,12 +17,15 @@ describe("compact contracts", () => {
     const legacy = JSON.parse(JSON.stringify(state)) as {
       agent: Record<string, unknown>;
       recovery: Record<string, unknown>;
+      session: Record<string, unknown>;
     };
     delete legacy.agent.pendingResult;
     delete legacy.recovery.lastFailureSignature;
     delete legacy.recovery.pendingAction;
     delete legacy.recovery.rollbackSequence;
+    delete legacy.session.finishedAt;
     const validatedLegacy = validateRecoveryState(legacy);
+    expect(validatedLegacy.session.finishedAt).toBeNull();
     expect(validatedLegacy.agent.pendingResult).toBeNull();
     expect(validatedLegacy.recovery).toMatchObject({
       lastFailureSignature: null,

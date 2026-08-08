@@ -414,7 +414,12 @@ async function continueCheckpoint(
   if (actual !== pending.baseCommit) {
     const count = await repository.commitCount(`${pending.baseCommit}..${actual}`);
     const message = await repository.commitMessage(actual);
-    if (count === 1 && operationTrailerMatches(message, state, pending)) {
+    if (
+      pending.observedHead === pending.baseCommit &&
+      count === 1 &&
+      await repository.isControllerAuthoredCommit(actual) &&
+      operationTrailerMatches(message, state, pending)
+    ) {
       if (options.guard === undefined) {
         throw new Error("checkpoint adoption requires a configured safety guard");
       }
@@ -540,7 +545,11 @@ async function continueRollback(
   if (actual !== pending.baseCommit) {
     const count = await repository.commitCount(`${pending.baseCommit}..${actual}`);
     const message = await repository.commitMessage(actual);
-    if (count === 1 && operationTrailerMatches(message, state, pending)) {
+    if (
+      count === 1 &&
+      await repository.isControllerAuthoredCommit(actual) &&
+      operationTrailerMatches(message, state, pending)
+    ) {
       const finished = await finishRevert(
         store,
         { commit: actual, revertedCommit: pending.targetCommit },
@@ -662,24 +671,31 @@ function operationTrailerMatches(
   state: RecoveryState,
   pending: PendingOperation,
 ): boolean {
-  return (
-    pending.unitId !== null &&
-    message.includes(`Recovery-Loop-Session: ${state.session.id}`) &&
-    message.includes(`Recovery-Loop-Unit: ${pending.unitId}`) &&
-    (pending.checkpointKind === null ||
-      message.includes(`Recovery-Loop-Kind: ${pending.checkpointKind}`))
-  );
+  if (pending.unitId === null) return false;
+  const expected = [
+    `Recovery-Loop-Session: ${state.session.id}`,
+    `Recovery-Loop-Unit: ${pending.unitId}`,
+    ...(pending.checkpointKind === null
+      ? []
+      : [`Recovery-Loop-Kind: ${pending.checkpointKind}`]),
+  ];
+  const lines = message.trimEnd().split(/\r?\n/u);
+  const start = lines.length - expected.length;
+  return start > 0 && lines[start - 1] === "" &&
+    expected.every((trailer, index) => lines[start + index] === trailer);
 }
 async function stopForCanonicality(
   store: StateStore,
   expected: string,
   actual: string,
 ): Promise<never> {
+  const finishedAt = new Date().toISOString();
   await store.update((draft) => {
     draft.phase = "stopped";
     draft.session.status = "stopped";
+    draft.session.finishedAt = finishedAt;
     draft.session.stopReason = `canonical branch ambiguity: expected ${expected}, actual ${actual}`;
-  });
+  }, finishedAt);
   throw new CanonicalityError(expected, actual, "unexplained non-descendant branch movement");
 }
 async function pathExists(candidate: string): Promise<boolean> {

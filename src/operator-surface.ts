@@ -72,6 +72,19 @@ export async function initializeRepository(
       config,
       now: new Date().toISOString(),
     });
+    const finishedAt = new Date().toISOString();
+    await store.update((draft) => {
+      draft.phase = "stopped";
+      draft.operation = null;
+      draft.session.status = "stopped";
+      draft.session.finishedAt = finishedAt;
+      draft.session.stopReason = "initialized";
+    }, finishedAt);
+    await store.appendEvent({
+      type: "session-stopped",
+      headCommit: baselineCommit,
+      data: { reason: "initialized", detail: null },
+    });
     const state = await store.readState();
     return {
       kind: "initialized",
@@ -161,6 +174,9 @@ export async function readStatusSnapshot(repositoryPath: string): Promise<Status
   const events = (await store.readEvents()).events;
   const actualHead = await repository.branchHead(state.repository.branch);
   const position = await knownGoodPosition(repository, state.health.knownGoodCommit, actualHead);
+  const elapsedEnd = state.session.status === "stopped"
+    ? Date.parse(state.session.finishedAt ?? state.updatedAt)
+    : Date.now();
   return {
     schemaVersion: 1,
     sessionId: state.session.id,
@@ -192,7 +208,7 @@ export async function readStatusSnapshot(repositoryPath: string): Promise<Status
     usage: {
       ...state.usage,
       checkpoints: await countSessionCheckpoints(repository, state, actualHead),
-      sessionElapsedMilliseconds: Math.max(0, Date.now() - Date.parse(state.session.startedAt)),
+      sessionElapsedMilliseconds: Math.max(0, elapsedEnd - Date.parse(state.session.startedAt)),
     },
     recentEvents: events.slice(-5).map((event) => ({
       sequence: event.sequence,

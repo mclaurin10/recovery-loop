@@ -7,6 +7,7 @@ export default defineConfig({
     testTimeout: 30_000,
     hookTimeout: 30_000,
     pool: "forks",
+    maxWorkers: 2,
     sequence: {
       concurrent: false,
     },

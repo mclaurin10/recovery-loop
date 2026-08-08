@@ -3,7 +3,7 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Codex } from "@openai/codex-sdk";
 import type { RecoveryConfig } from "./config.js";
-import { validateAgentResponse, type AgentResponse, type PendingAgentResult, type PendingOperation, type RecoveryState } from "./contracts.js";
+import { validateAgentResponse, type AgentResponse, type FailureAttempt, type PendingAgentResult, type PendingOperation, type RecoveryState } from "./contracts.js";
 import type { GitRepository } from "./git-repository.js";
 import { redact } from "./safety.js";
 import type { StateStore } from "./state-store.js";
@@ -31,7 +31,11 @@ export interface AgentUsage {
 }
 export interface RecoveryEvidence {
   checkId: string; failingCommand: readonly string[]; normalizedOutcome: string;
-  stdoutPath: string; stderrPath: string; firstBadCommit: string | null;
+  failedCommit: string; currentCommit: string; knownGoodCommit: string | null;
+  exitCode: number | null; signal: NodeJS.Signals | null; timedOut: boolean;
+  stdoutTail: string; stderrTail: string; error: string | null;
+  resultPath: string; stdoutPath: string; stderrPath: string;
+  confirmationAttempts: readonly FailureAttempt[]; firstBadCommit: string | null;
   regressionWindow: readonly [string, string] | null;
   firstBadDiff: string | null; previousRepairSummaries: readonly string[];
   fallbackAfterTurn: string;
@@ -167,13 +171,14 @@ export class CodexAgentGateway implements AgentGateway {
       const response = parseResponse(attempt.finalResponse);
       await writeJson(finalPath, sanitizeAgentResponse(response));
       await settleState(request.store, head, operation.id, threadId, usage, startedFresh, true, {
-        unitId: request.unitId, turnId, baseCommit: head, response,
+        unitId: request.unitId, turnId, baseCommit: head, mode: request.mode, response,
       });
       Object.assign(metadata, finishMetadata(started, "completed", threadId, usage, fallback, null));
       await writeJson(invocationPath, metadata);
       await request.store.appendEvent({ type: "agent-completed", headCommit: head,
         data: { unitId: request.unitId, mode: request.mode, turnId, threadId,
-          outcome: response.outcome, durationMs: Date.now() - started, usage } });
+          outcome: response.outcome, summary: sanitizeAgentResponse(response).summary,
+          durationMs: Date.now() - started, usage } });
       return { response, threadId, usage, turnId, logDirectory,
         resumed: decision.action === "resume" && !fallback, fallbackToFreshThread: fallback };
     } catch (error) {

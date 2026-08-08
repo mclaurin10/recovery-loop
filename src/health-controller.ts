@@ -201,6 +201,23 @@ export async function runScheduledChecks(
   const deep = await runDeep(options, commit);
   return observation(options.store, commit, [], deep);
 }
+export async function runRecoveryChecks(
+  options: HealthControllerOptions,
+  commit: string,
+): Promise<HealthObservation> {
+  const state = await options.store.readState();
+  if (state.phase !== "idle" || state.repository.expectedHead !== commit) {
+    throw new Error("post-repair checks require idle state at the durable head");
+  }
+  if (state.health.pendingFailure === null) {
+    throw new Error("post-repair checks require a pending failure");
+  }
+  await persistSchedule(options, { now: options.now, recoveryBoundary: true });
+  const smokeResults = await runSmoke(options, commit, false, true);
+  const smokePassed = commandSetPassed(smokeResults, options.config.checks.smoke, commit);
+  const deep = await runDeep(options, commit, true, smokePassed);
+  return observation(options.store, commit, smokeResults, deep);
+}
 export async function resumeInterruptedCheckSet(
   options: HealthControllerOptions,
   category: "smoke" | "deep",
@@ -219,9 +236,18 @@ export async function resumeInterruptedCheckSet(
   if (commit !== state.repository.expectedHead) {
     throw new Error(`interrupted ${category} set is not bound to the durable head`);
   }
+  const recoverySet = state.health.pendingFailure !== null &&
+    state.health.pendingFailure.discoveredAtCommit !== commit &&
+    state.cadence.deepReasons.includes(DEEP_CHECK_REASONS.recoveryBoundary);
   if (category === "deep") {
-    const deep = await runDeep(options, commit);
+    const deep = await runDeep(options, commit, recoverySet);
     return observation(options.store, commit, [], deep);
+  }
+  if (recoverySet) {
+    const smokeResults = await runSmoke(options, commit, false, true);
+    const smokePassed = commandSetPassed(smokeResults, options.config.checks.smoke, commit);
+    const deep = await runDeep(options, commit, true, smokePassed);
+    return observation(options.store, commit, smokeResults, deep);
   }
   await persistDerivedCheckpointRisk(options, commit);
   const baseline = commit === state.repository.baselineCommit;
@@ -247,16 +273,23 @@ async function runAfterSmoke(
   if (!baselineRequiresDeep && !state.cadence.deepRequired) {
     return observation(options.store, commit, smokeResults, null);
   }
-  const deep = await runDeep(options, commit);
+  const deep = await runDeep(options, commit, false, smokePassed);
   return observation(options.store, commit, smokeResults, deep);
 }
 async function runSmoke(
   options: HealthControllerOptions,
   commit: string,
   countsForCadence: boolean,
+  completeSet = false,
 ): Promise<CommandResult[]> {
   const now = timestamp(options.now);
-  const results = await runCommandSet(options, "smoke", commit, options.config.checks.smoke);
+  const results = await runCommandSet(
+    options,
+    "smoke",
+    commit,
+    options.config.checks.smoke,
+    completeSet,
+  );
   const passed = commandSetPassed(results, options.config.checks.smoke, commit);
   const failure = firstFailure(results);
   await options.store.update((draft) => {
@@ -276,11 +309,19 @@ async function runSmoke(
 async function runDeep(
   options: HealthControllerOptions,
   commit: string,
+  completeSet = false,
+  smokePassedThisRun?: boolean,
 ): Promise<DeepRunResult> {
   const now = timestamp(options.now);
   const before = await options.store.readState();
   const reasons = before.cadence.deepReasons.slice();
-  const results = await runCommandSet(options, "deep", commit, options.config.checks.deep);
+  const results = await runCommandSet(
+    options,
+    "deep",
+    commit,
+    options.config.checks.deep,
+    completeSet,
+  );
   const commandsPassed = commandSetPassed(results, options.config.checks.deep, commit);
   let boundaryFailure: FailureSource | null = null;
   if (commandsPassed) {
@@ -314,6 +355,7 @@ async function runDeep(
     const fullPass =
       commandsPassed &&
       boundaryFailure === null &&
+      smokePassedThisRun !== false &&
       draft.health.lastSmokePassCommit === commit;
     if (fullPass) {
       promoted = draft.health.knownGoodCommit !== commit;
@@ -325,7 +367,11 @@ async function runDeep(
       draft.cadence.deepReasons = [];
       return;
     }
-    if (failure !== null && draft.health.pendingFailure === null) {
+    if (
+      failure !== null &&
+      (draft.health.pendingFailure === null ||
+        draft.health.pendingFailure.discoveredAtCommit !== commit)
+    ) {
       setPendingFailure(draft, commit, failure);
     }
     draft.cadence.deepRequired = true;
@@ -347,6 +393,7 @@ async function runCommandSet(
   category: "smoke" | "deep",
   commit: string,
   commands: readonly CommandSpec[],
+  completeSet = false,
 ): Promise<CommandResult[]> {
   const state = await options.store.readState();
   const layout = await options.store.ensureSessionLayout(state.session.id);
@@ -359,6 +406,7 @@ async function runCommandSet(
     category,
     logRoot: layout.checks,
     sequenceStart: state.eventSequence + 1,
+    stopOnFailure: !completeSet,
     ...(hooks === undefined ? {} : { hooks }),
   });
 }
@@ -490,6 +538,10 @@ function setPendingFailure(
     repairAttempts: sameObservation ? existing.repairAttempts : 0,
     recoveryCycles: sameObservation ? existing.recoveryCycles : 0,
     latestResultPath: failure.resultPath,
+    confirmationAttempts: sameObservation ? existing.confirmationAttempts : [],
+    lastRepairCommit: sameObservation ? existing.lastRepairCommit : null,
+    lastEvaluatedRepairCommit: sameObservation ? existing.lastEvaluatedRepairCommit : null,
+    environmentAttempts: sameObservation ? existing.environmentAttempts : 0,
   };
   state.health.pendingFailure = pending;
   state.recovery.activeFailureId = pending.id;

@@ -104,6 +104,13 @@ export interface CommandResult {
   stderrTail: string;
   error: string | null;
 }
+export interface FailureAttempt {
+  attempt: number;
+  commit: string;
+  classification: CommandClassification;
+  signature: string;
+  resultPath: string;
+}
 export const AGENT_OUTCOMES = ["changed", "no_change", "goal_complete", "blocked"] as const;
 export type AgentOutcome = (typeof AGENT_OUTCOMES)[number];
 export interface AgentResponse {
@@ -169,6 +176,10 @@ export interface PendingFailure {
   repairAttempts: number;
   recoveryCycles: number;
   latestResultPath: string;
+  confirmationAttempts: FailureAttempt[];
+  lastRepairCommit: string | null;
+  lastEvaluatedRepairCommit: string | null;
+  environmentAttempts: number;
 }
 export interface AbandonedRange {
   oldHead: string;
@@ -177,7 +188,8 @@ export interface AbandonedRange {
   recordedAt: string;
 }
 export interface PendingAgentResult {
-  unitId: string; turnId: string; baseCommit: string; response: AgentResponse;
+  unitId: string; turnId: string; baseCommit: string;
+  mode: "work" | "recovery"; response: AgentResponse;
 }
 export interface RecoveryState {
   schemaVersion: typeof STATE_SCHEMA_VERSION;
@@ -218,6 +230,7 @@ export interface RecoveryState {
   recovery: {
     activeFailureId: string | null;
     sameSignatureCycles: number;
+    lastFailureSignature: string | null;
     abandonedRanges: AbandonedRange[];
     rescueRefs: string[];
   };
@@ -245,6 +258,12 @@ export type EventType =
   | "check-started"
   | "check-completed"
   | "failure-observed"
+  | "confirmation-attempted"
+  | "failure-confirmed"
+  | "failure-classified"
+  | "failure-repaired"
+  | "repair-started"
+  | "repair-evaluated"
   | "known-good-advanced"
   | "rescue-ref-created"
   | "revert-created"
@@ -276,6 +295,42 @@ function expectIsoDate(value: unknown, path: string): string {
     throw new ValidationError(path, "expected an ISO date-time");
   }
   return date;
+}
+export function validateCommandResult(value: unknown, valuePath = "commandResult"): CommandResult {
+  const object = expectObject(value, valuePath);
+  expectExactKeys(object, valuePath, [
+    "checkId", "argv", "commit", "startedAt", "finishedAt", "durationMs", "exitCode",
+    "signal", "timedOut", "classification", "signature", "worktreeChanged", "stdoutPath",
+    "stderrPath", "stdoutTail", "stderrTail", "error",
+  ]);
+  if (!Array.isArray(object.argv)) throw new ValidationError(`${valuePath}.argv`, "expected an array");
+  const signal = object.signal === null ? null : expectNonEmptyString(object.signal, `${valuePath}.signal`);
+  const exitCode = object.exitCode === null
+    ? null
+    : expectNonNegativeInteger(object.exitCode, `${valuePath}.exitCode`);
+  const nullableText = (entry: unknown, path: string): string | null =>
+    entry === null ? null : expectString(entry, path);
+  return {
+    checkId: expectNonEmptyString(object.checkId, `${valuePath}.checkId`),
+    argv: object.argv.map((entry, index) => expectNonEmptyString(entry, `${valuePath}.argv[${index}]`)),
+    commit: expectCommit(object.commit, `${valuePath}.commit`),
+    startedAt: expectIsoDate(object.startedAt, `${valuePath}.startedAt`),
+    finishedAt: expectIsoDate(object.finishedAt, `${valuePath}.finishedAt`),
+    durationMs: expectNonNegativeInteger(object.durationMs, `${valuePath}.durationMs`),
+    exitCode,
+    signal: signal as NodeJS.Signals | null,
+    timedOut: expectBoolean(object.timedOut, `${valuePath}.timedOut`),
+    classification: expectEnum(object.classification, `${valuePath}.classification`, [
+      "pass", "product", "infrastructure", "flaky", "safety",
+    ] as const),
+    signature: expectString(object.signature, `${valuePath}.signature`),
+    worktreeChanged: expectBoolean(object.worktreeChanged, `${valuePath}.worktreeChanged`),
+    stdoutPath: nullableText(object.stdoutPath, `${valuePath}.stdoutPath`),
+    stderrPath: nullableText(object.stderrPath, `${valuePath}.stderrPath`),
+    stdoutTail: expectString(object.stdoutTail, `${valuePath}.stdoutTail`),
+    stderrTail: expectString(object.stderrTail, `${valuePath}.stderrTail`),
+    error: nullableText(object.error, `${valuePath}.error`),
+  };
 }
 function validatePendingOperation(value: unknown, path: string): PendingOperation | null {
   if (value === null) return null;
@@ -318,6 +373,19 @@ function validatePendingOperation(value: unknown, path: string): PendingOperatio
     startedAt: expectIsoDate(object.startedAt, `${path}.startedAt`),
   };
 }
+function validateFailureAttempt(value: unknown, path: string): FailureAttempt {
+  const object = expectObject(value, path);
+  expectExactKeys(object, path, ["attempt", "commit", "classification", "signature", "resultPath"]);
+  return {
+    attempt: expectPositiveInteger(object.attempt, `${path}.attempt`),
+    commit: expectCommit(object.commit, `${path}.commit`),
+    classification: expectEnum(object.classification, `${path}.classification`, [
+      "pass", "product", "infrastructure", "flaky", "safety",
+    ] as const),
+    signature: expectString(object.signature, `${path}.signature`),
+    resultPath: expectNonEmptyString(object.resultPath, `${path}.resultPath`),
+  };
+}
 function validatePendingFailure(value: unknown, path: string): PendingFailure | null {
   if (value === null) return null;
   const object = expectObject(value, path);
@@ -334,7 +402,7 @@ function validatePendingFailure(value: unknown, path: string): PendingFailure | 
     "repairAttempts",
     "recoveryCycles",
     "latestResultPath",
-  ]);
+  ], ["confirmationAttempts", "lastRepairCommit", "lastEvaluatedRepairCommit", "environmentAttempts"]);
   const failureClasses = ["product", "infrastructure", "flaky", "safety"] as const;
   let regressionWindow: [string, string] | null = null;
   if (object.regressionWindow !== null) {
@@ -359,6 +427,21 @@ function validatePendingFailure(value: unknown, path: string): PendingFailure | 
     repairAttempts: expectNonNegativeInteger(object.repairAttempts, `${path}.repairAttempts`),
     recoveryCycles: expectNonNegativeInteger(object.recoveryCycles, `${path}.recoveryCycles`),
     latestResultPath: expectString(object.latestResultPath, `${path}.latestResultPath`),
+    confirmationAttempts: object.confirmationAttempts === undefined
+      ? []
+      : Array.isArray(object.confirmationAttempts)
+        ? object.confirmationAttempts.map((entry, index) =>
+            validateFailureAttempt(entry, `${path}.confirmationAttempts[${index}]`))
+        : (() => { throw new ValidationError(`${path}.confirmationAttempts`, "expected an array"); })(),
+    lastRepairCommit: object.lastRepairCommit === undefined
+      ? null
+      : expectNullableCommit(object.lastRepairCommit, `${path}.lastRepairCommit`),
+    lastEvaluatedRepairCommit: object.lastEvaluatedRepairCommit === undefined
+      ? null
+      : expectNullableCommit(object.lastEvaluatedRepairCommit, `${path}.lastEvaluatedRepairCommit`),
+    environmentAttempts: object.environmentAttempts === undefined
+      ? 0
+      : expectNonNegativeInteger(object.environmentAttempts, `${path}.environmentAttempts`),
   };
 }
 function validateAbandonedRange(value: unknown, path: string): AbandonedRange {
@@ -374,11 +457,14 @@ function validateAbandonedRange(value: unknown, path: string): AbandonedRange {
 function validatePendingAgentResult(value: unknown, path: string): PendingAgentResult | null {
   if (value === null) return null;
   const object = expectObject(value, path);
-  expectExactKeys(object, path, ["unitId", "turnId", "baseCommit", "response"]);
+  expectExactKeys(object, path, ["unitId", "turnId", "baseCommit", "response"], ["mode"]);
   return {
     unitId: expectNonEmptyString(object.unitId, `${path}.unitId`),
     turnId: expectNonEmptyString(object.turnId, `${path}.turnId`),
     baseCommit: expectCommit(object.baseCommit, `${path}.baseCommit`),
+    mode: object.mode === undefined
+      ? "work"
+      : expectEnum(object.mode, `${path}.mode`, ["work", "recovery"] as const),
     response: validateAgentResponse(object.response),
   };
 }
@@ -445,7 +531,7 @@ export function validateRecoveryState(value: unknown): RecoveryState {
     "sameSignatureCycles",
     "abandonedRanges",
     "rescueRefs",
-  ]);
+  ], ["lastFailureSignature"]);
   const usage = expectObject(state.usage, "state.usage");
   expectExactKeys(usage, "state.usage", [
     "agentTurns",
@@ -535,6 +621,12 @@ export function validateRecoveryState(value: unknown): RecoveryState {
         recovery.sameSignatureCycles,
         "state.recovery.sameSignatureCycles",
       ),
+      lastFailureSignature: recovery.lastFailureSignature === undefined
+        ? null
+        : expectNullableString(
+            recovery.lastFailureSignature,
+            "state.recovery.lastFailureSignature",
+          ),
       abandonedRanges: recovery.abandonedRanges.map((entry, index) =>
         validateAbandonedRange(entry, `state.recovery.abandonedRanges[${index}]`),
       ),
@@ -595,6 +687,7 @@ export function createInitialState(options: InitialStateOptions): RecoveryState 
     recovery: {
       activeFailureId: null,
       sameSignatureCycles: 0,
+      lastFailureSignature: null,
       abandonedRanges: [],
       rescueRefs: [],
     },

@@ -3,7 +3,10 @@ import type { AgentGateway } from "./agent-gateway.js";
 import { AgentTimeoutError, rotateAgentThread } from "./agent-gateway.js";
 import { validateConfig, type RecoveryConfig } from "./config.js";
 import type { PendingAgentResult, RecoveryState } from "./contracts.js";
-import { reconcileStartup, type StartupReconcileResult } from "./git-operations.js";
+import {
+  reconcileStartup,
+  type StartupReconcileResult,
+} from "./git-operations.js";
 import { GitRepository } from "./git-repository.js";
 import {
   checkpointAndCheck,
@@ -11,6 +14,11 @@ import {
   runScheduledChecks,
   type HealthControllerOptions,
 } from "./health-controller.js";
+import {
+  processRecoveryResult,
+  recoverPendingFailure,
+  type RecoveryControllerOptions,
+} from "./recovery.js";
 import { assertCheckpointSafe, SafetyGuardError } from "./safety.js";
 import { StateStore } from "./state-store.js";
 
@@ -19,7 +27,8 @@ export * from "./health-controller.js";
 export type RunStopReason =
   | "goal-candidate-ready" | "recovery-pending" | "blocked" | "no-progress"
   | "max-agent-turns" | "max-checkpoints" | "max-wall-time" | "signal"
-  | "agent-turn-timeout" | "agent-error" | "guard-rejected";
+  | "agent-turn-timeout" | "agent-error" | "guard-rejected" | "repair-exhausted"
+  | "recovery-flaky" | "recovery-infrastructure" | "recovery-safety";
 export interface RunLimits { maxAgentTurns?: number; maxCheckpoints?: number; maxMinutes?: number }
 export interface RunControllerHooks {
   afterStartup?: (result: StartupReconcileResult) => void | Promise<void>;
@@ -74,6 +83,8 @@ async function runLocked(options: RunControllerOptions, store: StateStore): Prom
     if (startup.action === "resume-agent" || startup.action === "resume-repair") {
       const resumed = await store.readState();
       await store.finishOperation(resumed.repository.expectedHead);
+    } else if (startup.action === "restart-diagnosis") {
+      await store.finishOperation((await store.readState()).repository.expectedHead);
     }
     await options.hooks?.afterStartup?.(startup);
   } catch (error) {
@@ -92,17 +103,27 @@ async function runLocked(options: RunControllerOptions, store: StateStore): Prom
   try {
     while (true) {
       state = await store.readState();
-      if (state.health.pendingFailure !== null) return await stopSession(context.operator, store, "recovery-pending", state.health.pendingFailure.id, clock);
+      if (state.agent.pendingResult !== null) {
+        const processed = state.agent.pendingResult.mode === "recovery"
+          ? await processRecoveryResult(recoveryOptions(context), state.agent.pendingResult)
+          : await processAgentResult(context, state.agent.pendingResult);
+        if (processed.stop !== null && processed.stop !== "recovery-pending") {
+          return await stopSession(context.operator, store, processed.stop, processed.detail, clock);
+        }
+        continue;
+      }
       const abortStop = stopForAbort(context.signal);
       if (abortStop !== null) return await stopSession(context.operator, store, abortStop, null, clock);
-      if (state.agent.pendingResult !== null) {
-        const processed = await processAgentResult(context, state.agent.pendingResult);
-        if (processed.stop !== null) return await stopSession(context.operator, store, processed.stop, processed.detail, clock);
+      if (state.health.pendingFailure !== null) {
+        const recovered = await recoverPendingFailure(recoveryOptions(context), state.health.pendingFailure);
+        if (recovered.stop !== null) {
+          return await stopSession(context.operator, store, recovered.stop, recovered.detail, clock);
+        }
         continue;
       }
       const scheduled = await runScheduledChecks(healthOptions(context));
       if (scheduled?.pendingFailure !== null && scheduled?.pendingFailure !== undefined) {
-        return await stopSession(context.operator, store, "recovery-pending", scheduled.pendingFailure.id, clock);
+        continue;
       }
       state = await store.readState();
       if (state.agent.turns >= config.limits.maxAgentTurns) return await stopSession(context.operator, store, "max-agent-turns", null, clock);
@@ -193,6 +214,22 @@ async function resumeStartupCheck(result: StartupReconcileResult, options: Healt
 function healthOptions(context: LoopContext): HealthControllerOptions {
   return { store: context.store, repository: context.worktree, config: context.config, now: context.clock().toISOString() };
 }
+function recoveryOptions(context: LoopContext): RecoveryControllerOptions {
+  return {
+    operator: context.operator,
+    worktree: context.worktree,
+    store: context.store,
+    gateway: context.gateway,
+    config: context.config,
+    maxCheckpoints: context.maxCheckpoints,
+    signal: context.signal,
+    clock: context.clock,
+    abortStop: () => stopForAbort(context.signal),
+    ...(context.hooks?.afterCheckpointMutation === undefined
+      ? {}
+      : { afterCheckpointMutation: context.hooks.afterCheckpointMutation }),
+  };
+}
 async function checkpointGuard(repository: GitRepository, config: RecoveryConfig, expectedBase: string, worktreePath: string): Promise<void> {
   await assertCheckpointSafe(repository, {
     expectedBranch: config.branch, expectedBase, protectedPaths: config.protectedPaths,
@@ -223,16 +260,31 @@ async function stopSession(operator: GitRepository, store: StateStore, reason: R
     checkpoints: await countSessionCheckpoints(operator, state),
     smokeExecutions: events.filter((event) => event.type === "check-completed" && event.data.category === "smoke").length,
     deepExecutions: events.filter((event) => event.type === "check-completed" && event.data.category === "deep").length,
+    diagnosticExecutions: events.filter((event) => event.type === "check-completed" &&
+      (event.data.category === "diagnostic" || event.data.category === "prepare")).length,
     checkMilliseconds: state.usage.checkMilliseconds,
     regressionsObserved: count("failure-observed"), confirmedRegressions: count("failure-confirmed"),
     regressionsRepaired: count("failure-repaired"), reverts: count("revert-created"), hardRollbacks: count("rollback-completed"),
+    confirmationAttempts: count("confirmation-attempted"), repairTurns: count("repair-started"),
+    repairCheckpoints: events.filter((event) => event.type === "checkpoint-created" && event.data.kind === "repair").length,
+    repairEvaluations: count("repair-evaluated"), recoveryCycles: count("failure-confirmed"),
+    environmentAttempts: events.filter((event) => event.type === "failure-classified" &&
+      typeof event.data.environmentAttempt === "number").length,
+    recoveryClassifications: Object.fromEntries(["product", "flaky", "infrastructure", "safety"]
+      .map((classification) => [classification, events.filter((event) =>
+        event.type === "failure-classified" && event.data.classification === classification).length])),
     rescueRefs,
-    flakyChecks: events.filter((event) => event.type === "check-completed" && event.data.classification === "flaky").length,
+    flakyChecks: events.filter((event) =>
+      (event.type === "check-completed" || event.type === "failure-classified") &&
+      event.data.classification === "flaky").length,
     humanInterventions: 0,
     recovery: { activeFailureId: state.recovery.activeFailureId, sameSignatureCycles: state.recovery.sameSignatureCycles,
+      lastFailureSignature: state.recovery.lastFailureSignature,
       abandonedRanges: state.recovery.abandonedRanges.length, rescueRefs: state.recovery.rescueRefs.length,
       pendingRepairAttempts: state.health.pendingFailure?.repairAttempts ?? 0,
-      pendingRecoveryCycles: state.health.pendingFailure?.recoveryCycles ?? 0 },
+      pendingRecoveryCycles: state.health.pendingFailure?.recoveryCycles ?? 0,
+      pendingConfirmationAttempts: state.health.pendingFailure?.confirmationAttempts.length ?? 0,
+      pendingEnvironmentAttempts: state.health.pendingFailure?.environmentAttempts ?? 0 },
     pendingFailure: state.health.pendingFailure,
     agentCompletionBelief: events.some((event) => event.type === "agent-completed" && event.data.outcome === "goal_complete"),
     finalHeadReceivedDeepPass: state.health.knownGoodCommit === finalCommit && state.health.lastDeepRunCommit === finalCommit,
@@ -279,7 +331,7 @@ function linkedSignal(external: AbortSignal | undefined, deadline: number, clock
   timer.unref();
   return { signal: controller.signal, dispose: () => { clearTimeout(timer); external?.removeEventListener("abort", forward); } };
 }
-function stopForAbort(signal: AbortSignal): RunStopReason | null {
+function stopForAbort(signal: AbortSignal): "max-wall-time" | "signal" | null {
   if (!signal.aborted) return null;
   return signal.reason instanceof WallTimeLimit ? "max-wall-time" : "signal";
 }

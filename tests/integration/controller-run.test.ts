@@ -145,7 +145,7 @@ describe("Stage 7 normal controller cycles", () => {
     expect(events.some((event) => event.type === "thread-rotated" && event.data.reason === "agent-history-violation")).toBe(true);
   }, 60_000);
 
-  it("persists a failing completion check and stops at the explicit recovery boundary", async () => {
+  it("persists a failing completion check and reaches the bounded Stage 9 boundary", async () => {
     const created = await fixture();
     await updateConfig(created, (config) => {
       config.checks.deep = [{
@@ -154,14 +154,20 @@ describe("Stage 7 normal controller cycles", () => {
       }];
     });
     const test = await initialize(created);
-    const { result } = await run(test, [{
-      method: "start", response: response("goal_complete", "all configured checks passed"),
-      action: ({ workingDirectory }) => writeFile(path.join(workingDirectory, "source.txt"), "bad\n"),
-    }]);
+    const { result } = await run(test, [
+      {
+        method: "start", response: response("goal_complete", "all configured checks passed"),
+        action: ({ workingDirectory }) => writeFile(path.join(workingDirectory, "source.txt"), "bad\n"),
+      },
+      { method: "resume", response: response("no_change", "first repair found no safe edit") },
+      { method: "resume", response: response("no_change", "second repair found no safe edit") },
+    ]);
     const state = await test.store.readState();
-    expect(result.summary).toMatchObject({ stopReason: "recovery-pending", agentCompletionBelief: true, finalHeadReceivedDeepPass: false });
+    expect(result.summary).toMatchObject({ stopReason: "repair-exhausted", agentCompletionBelief: true,
+      finalHeadReceivedDeepPass: false, confirmedRegressions: 1, repairTurns: 2 });
     expect(state.phase).toBe("stopped");
-    expect(state.health.pendingFailure).toMatchObject({ checkId: "deep", classification: "product", discoveredAtCommit: await test.worktree.head() });
+    expect(state.health.pendingFailure).toMatchObject({ checkId: "deep", classification: "product",
+      confirmed: true, repairAttempts: 2, discoveredAtCommit: await test.worktree.head() });
     expect(await test.worktree.commitCount(`${state.repository.baselineCommit}..HEAD`)).toBe(1);
   });
 

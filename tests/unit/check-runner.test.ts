@@ -344,6 +344,14 @@ describe("environment and confirmation", () => {
       classification: "flaky",
     });
     expect(failPassPass.attempts).toHaveLength(3);
+
+    const resumedAttempts: number[] = [];
+    const resumed = await confirmFailure(failure, async (attempt) => {
+      resumedAttempts.push(attempt);
+      return failure;
+    }, [failure, pass]);
+    expect(resumed).toMatchObject({ confirmedFailure: true, consensus: "fail" });
+    expect(resumedAttempts).toEqual([3]);
   });
 });
 

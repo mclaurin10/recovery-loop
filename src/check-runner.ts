@@ -179,6 +179,18 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
     env: sanitizeEnvironment(process.env, options.environment),
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const completion = new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (!settled) { settled = true; resolve(); }
+    };
+    child.once("error", (error) => { spawnError = error; finish(); });
+    child.once("close", (code, closedSignal) => {
+      exitCode = code;
+      signal = closedSignal;
+      finish();
+    });
+  });
   child.stdout.on("data", (chunk: Buffer) => stdoutTail.append(chunk));
   child.stderr.on("data", (chunk: Buffer) => stderrTail.append(chunk));
   child.stdout.pipe(stdoutStream);
@@ -202,16 +214,7 @@ export async function runCommand(options: RunCommandOptions): Promise<CommandRes
     void terminateProcessTree(child, options.terminationGraceMs ?? 1_000);
   }, Math.max(1, Math.round(options.command.timeoutSeconds * 1_000)));
   timeout.unref();
-  await new Promise<void>((resolve) => {
-    child.once("error", (error) => {
-      spawnError = error;
-    });
-    child.once("close", (code, closedSignal) => {
-      exitCode = code;
-      signal = closedSignal;
-      resolve();
-    });
-  });
+  await completion;
   clearTimeout(timeout);
   const streamResults = await Promise.allSettled([finished(stdoutStream), finished(stderrStream)]);
   for (const streamResult of streamResults) {
@@ -390,12 +393,24 @@ export async function runJournaledCommandSet(options: {
 export async function confirmFailure(
   first: CommandResult,
   rerun: (attempt: 2 | 3) => Promise<CommandResult>,
+  persistedAttempts: readonly CommandResult[] = [first],
 ): Promise<ConfirmationResult> {
   if (first.classification === "pass") throw new Error("failure confirmation requires a failing first result");
-  const attempts = [first, await rerun(2)];
+  if (persistedAttempts.length === 0 || persistedAttempts.length > 3) {
+    throw new Error("failure confirmation requires one to three persisted attempts");
+  }
+  const attempts = [...persistedAttempts];
+  if (
+    attempts[0]?.checkId !== first.checkId ||
+    attempts[0].commit !== first.commit ||
+    attempts[0].signature !== first.signature
+  ) {
+    throw new Error("persisted confirmation history does not begin with the original failure");
+  }
+  if (attempts.length < 2) attempts.push(await rerun(2));
   const initialConsensus = findConsensus(attempts);
   if (initialConsensus !== null) return confirmation(attempts, initialConsensus);
-  attempts.push(await rerun(3));
+  if (attempts.length < 3) attempts.push(await rerun(3));
   const finalConsensus = findConsensus(attempts);
   if (finalConsensus !== null) return confirmation(attempts, finalConsensus);
   return {
@@ -599,6 +614,6 @@ function waitForOpen(stream: WriteStream): Promise<void> {
 }
 function checkPhase(category: CommandCategory): Phase {
   if (category === "deep") return "deep-checking";
-  if (category === "diagnostic") return "diagnosing";
+  if (category === "diagnostic" || category === "prepare") return "diagnosing";
   return "smoke-checking";
 }

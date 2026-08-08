@@ -358,7 +358,7 @@ export async function reconcileStartup(
       summary: state.operation?.summary ?? "preserve interrupted work",
       sessionId: state.session.id,
       unitId,
-      kind: "interrupted",
+      kind: state.phase === "repairing" ? "repair" : "interrupted",
       guard: async () => options.guard!(worktree),
       ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
     });
@@ -380,7 +380,9 @@ export async function reconcileStartup(
       summary: completed?.response.summary ?? "preserve unexplained recoverable worktree edits",
       sessionId: state.session.id,
       unitId: completed?.unitId ?? `interrupted-${state.eventSequence + 1}`,
-      kind: completed === null ? "interrupted" : "work",
+      kind: completed === null
+        ? "interrupted"
+        : completed.mode === "recovery" ? "repair" : "work",
       guard: async () => options.guard!(worktree),
       ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
     });

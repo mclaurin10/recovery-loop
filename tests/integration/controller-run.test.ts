@@ -90,7 +90,8 @@ describe("Stage 7 normal controller cycles", () => {
     expect(result.summary).toMatchObject({
       stopReason: "goal-candidate-ready", checkpoints: 3, smokeExecutions: 4,
       deepExecutions: 3, agentTurns: 3, agentCompletionBelief: true,
-      finalHeadReceivedDeepPass: true, pendingFailure: null,
+      finalHeadReceivedDeepPass: true, externalCorrectnessEvaluated: false,
+      externalCorrectness: null, pendingFailure: null,
     });
     expect(await markerCount(smokeMarker)).toBe(4);
     expect(await markerCount(deepMarker)).toBe(3);

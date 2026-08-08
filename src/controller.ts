@@ -317,6 +317,8 @@ async function stopSession(operator: GitRepository, store: StateStore, reason: R
     pendingFailure: state.health.pendingFailure,
     agentCompletionBelief: events.some((event) => event.type === "agent-completed" && event.data.outcome === "goal_complete"),
     finalHeadReceivedDeepPass: state.health.knownGoodCommit === finalCommit && state.health.lastDeepRunCommit === finalCommit,
+    externalCorrectnessEvaluated: false,
+    externalCorrectness: null,
   };
   return { summary, summaryPath: await store.writeSummary(state.session.id, summary) };
 }

@@ -140,7 +140,7 @@ describe("scaffoldContract", () => {
     const first = await scaffoldContract(root);
     expect(first.created).toEqual(["RECOVERY_GOAL.md", ".recovery-loop/config.json"]);
     expect(validateConfig(JSON.parse(await readFile(path.join(root, ".recovery-loop/config.json"), "utf8"))))
-      .toBeDefined();
+      .toMatchObject({ agent: { model: "gpt-5.6-sol", networkAccess: false } });
     expect(await readFile(path.join(root, "RECOVERY_GOAL.md"), "utf8")).toMatchInlineSnapshot(`
       "# Recovery Loop Product Goal
 

@@ -31,6 +31,7 @@ export const DEEP_CHECK_REASONS = {
   changedLines: "changed-lines",
   goalCompletion: "goal-completion",
   recoveryBoundary: "recovery-boundary",
+  operatorRequest: "operator-request",
   explicitState: "explicit-state",
   retry: "deep-retry",
 } as const;
@@ -150,7 +151,29 @@ export async function checkBaseline(
     draft.cadence.deepRequired = true;
     draft.cadence.deepReasons = [DEEP_CHECK_REASONS.initialBaseline];
   }, now);
-  return runAfterSmoke(options, state.repository.baselineCommit, false, true);
+  const prepareFailure = await runBaselinePrepare(options, state.repository.baselineCommit);
+  const result = await runAfterSmoke(
+    options,
+    state.repository.baselineCommit,
+    false,
+    true,
+    prepareFailure === null,
+  );
+  if (prepareFailure === null) return result;
+  await options.store.update((draft) => {
+    setPendingFailure(draft, state.repository.baselineCommit, prepareFailure);
+    draft.cadence.deepRequired = true;
+    draft.cadence.deepReasons = unique([
+      ...draft.cadence.deepReasons,
+      DEEP_CHECK_REASONS.retry,
+    ]);
+  }, now);
+  await appendFailureEvent(options.store, state.repository.baselineCommit, prepareFailure);
+  return {
+    ...result,
+    knownGoodPromoted: false,
+    pendingFailure: (await options.store.readState()).health.pendingFailure,
+  };
 }
 export async function checkpointAndCheck(
   options: CheckpointAndCheckOptions,
@@ -218,6 +241,33 @@ export async function runRecoveryChecks(
   const deep = await runDeep(options, commit, true, smokePassed);
   return observation(options.store, commit, smokeResults, deep);
 }
+export async function runManualChecks(
+  options: HealthControllerOptions,
+  includeDeep: boolean,
+): Promise<HealthObservation> {
+  const state = await options.store.readState();
+  if (state.phase !== "idle") {
+    throw new Error(`manual checks require idle state, found ${state.phase}`);
+  }
+  const commit = await options.repository.assertBranchIdentity(options.config.branch);
+  if (commit !== state.repository.expectedHead) {
+    throw new Error(`actual head ${commit} does not match durable head ${state.repository.expectedHead}`);
+  }
+  if (includeDeep) {
+    await options.store.update((draft) => {
+      draft.cadence.deepRequired = true;
+      draft.cadence.deepReasons = unique([
+        ...draft.cadence.deepReasons,
+        DEEP_CHECK_REASONS.operatorRequest,
+      ]);
+    }, timestamp(options.now));
+  }
+  const smokeResults = await runSmoke(options, commit, false, true);
+  if (!includeDeep) return observation(options.store, commit, smokeResults, null);
+  const smokePassed = commandSetPassed(smokeResults, options.config.checks.smoke, commit);
+  const deep = await runDeep(options, commit, true, smokePassed);
+  return observation(options.store, commit, smokeResults, deep);
+}
 export async function resumeInterruptedCheckSet(
   options: HealthControllerOptions,
   category: "smoke" | "deep",
@@ -263,6 +313,7 @@ async function runAfterSmoke(
   commit: string,
   countsForCadence: boolean,
   baselineRequiresDeep: boolean,
+  prerequisitePassed = true,
 ): Promise<HealthObservation> {
   const smokeResults = await runSmoke(options, commit, countsForCadence);
   const smokePassed = commandSetPassed(smokeResults, options.config.checks.smoke, commit);
@@ -273,8 +324,37 @@ async function runAfterSmoke(
   if (!baselineRequiresDeep && !state.cadence.deepRequired) {
     return observation(options.store, commit, smokeResults, null);
   }
-  const deep = await runDeep(options, commit, false, smokePassed);
+  const deep = await runDeep(options, commit, false, smokePassed && prerequisitePassed);
   return observation(options.store, commit, smokeResults, deep);
+}
+async function runBaselinePrepare(
+  options: HealthControllerOptions,
+  commit: string,
+): Promise<FailureSource | null> {
+  if (options.config.prepare === null) return null;
+  const state = await options.store.readState();
+  const layout = await options.store.ensureSessionLayout(state.session.id);
+  const [result] = await runJournaledCommandSet({
+    store: options.store,
+    repository: options.repository,
+    commands: [{
+      id: "prepare-baseline",
+      argv: options.config.prepare.argv,
+      timeoutSeconds: options.config.prepare.timeoutSeconds,
+    }],
+    commit,
+    category: "prepare",
+    logRoot: layout.checks,
+    sequenceStart: state.eventSequence + 1,
+  });
+  if (result === undefined) throw new Error("baseline prepare command produced no result");
+  if (result.classification === "pass" && !result.worktreeChanged) return null;
+  return {
+    checkId: result.checkId,
+    classification: result.classification === "safety" ? "safety" : "infrastructure",
+    signature: result.signature,
+    resultPath: commandResultPath(result),
+  };
 }
 async function runSmoke(
   options: HealthControllerOptions,
@@ -502,14 +582,15 @@ function firstFailure(results: readonly CommandResult[]): FailureSource | null {
     (candidate) => candidate.classification !== "pass" || candidate.worktreeChanged,
   );
   if (result === undefined || result.classification === "pass") return null;
-  const resultFile =
-    result.stdoutPath === null ? "" : path.join(path.dirname(result.stdoutPath), "result.json");
   return {
     checkId: result.checkId,
     classification: result.classification,
     signature: result.signature,
-    resultPath: resultFile,
+    resultPath: commandResultPath(result),
   };
+}
+function commandResultPath(result: CommandResult): string {
+  return result.stdoutPath === null ? "" : path.join(path.dirname(result.stdoutPath), "result.json");
 }
 function syntheticFailure(checkId: string, detail: string): FailureSource {
   return {

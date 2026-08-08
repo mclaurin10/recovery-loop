@@ -47,4 +47,18 @@ describe("CLI parsing", () => {
     expect(helpText()).not.toContain("approve");
     expect(parseCli(["run", "--help"])).toEqual({ command: "help", topic: "run" });
   });
+
+  it("provides complete help for exactly the four release commands", () => {
+    for (const command of ["init", "run", "status", "check"] as const) {
+      const help = helpText(command);
+      expect(help).toContain(`Usage: recovery-loop ${command}`);
+      expect(help).toContain("--help");
+      expect(parseCli([command, "--help"])).toEqual({ command: "help", topic: command });
+    }
+    const root = helpText();
+    expect(root.match(/^ {2}\w+/gmu)).toHaveLength(4);
+    for (const deferred of ["plan", "review", "approve", "integrate", "reconcile", "retention", "canary", "doctor", "rollback"]) {
+      expect(root).not.toContain(`  ${deferred}`);
+    }
+  });
 });

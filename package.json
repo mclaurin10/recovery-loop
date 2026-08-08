@@ -22,7 +22,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:acceptance": "vitest run tests/integration tests/unit tests/acceptance",
-    "test:agent-live": "vitest run --config vitest.live.config.ts"
+    "test:agent-live": "vitest run --config vitest.live.config.ts",
+    "demo:live": "vitest run --config vitest.live.config.ts"
   },
   "devDependencies": {
     "@eslint/js": "9.32.0",

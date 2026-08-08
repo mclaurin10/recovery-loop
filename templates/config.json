@@ -39,7 +39,7 @@
   },
   "protectedPaths": ["RECOVERY_GOAL.md", ".recovery-loop/config.json"],
   "agent": {
-    "model": "CONFIGURE_AT_INITIALIZATION",
+    "model": "gpt-5.6-sol",
     "reasoningEffort": "high",
     "networkAccess": false
   }

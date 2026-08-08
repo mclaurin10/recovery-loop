@@ -4,8 +4,32 @@ import { pathToFileURL } from "node:url";
 import { CodexAgentGateway } from "./agent-gateway.js";
 import { runNormalController } from "./controller.js";
 import { GitRepository } from "./git-repository.js";
-import { StateStore, type LockSnapshot } from "./state-store.js";
-import type { PendingFailure, Phase } from "./contracts.js";
+import {
+  CheckCommandFailed,
+  checkRepository,
+  initializeRepository,
+  readStatusSnapshot,
+  renderCheckResult,
+  renderInitResult,
+  renderRunSummary,
+  renderStatus,
+} from "./operator-surface.js";
+export {
+  CheckCommandFailed,
+  checkRepository,
+  initializeRepository,
+  readStatusSnapshot,
+  renderCheckResult,
+  renderInitResult,
+  renderRunSummary,
+  renderStatus,
+  type InitCommandOptions,
+  type InitResult,
+  type ManualCheckResult,
+  type StatusCheckOutcome,
+  type StatusSnapshot,
+} from "./operator-surface.js";
+
 export type ParsedCommand =
   | { command: "init"; base?: string; worktree?: string }
   | {
@@ -41,9 +65,7 @@ function positiveInteger(value: string, flag: string): number {
     throw new CliUsageError(`${flag} requires a positive integer`);
   }
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) {
-    throw new CliUsageError(`${flag} is too large`);
-  }
+  if (!Number.isSafeInteger(parsed)) throw new CliUsageError(`${flag} is too large`);
   return parsed;
 }
 function rejectDuplicate(seen: Set<string>, flag: string): void {
@@ -128,20 +150,82 @@ export function parseCli(argv: readonly string[]): ParsedCommand {
   throw new CliUsageError(`unknown command: ${command}`);
 }
 export function helpText(topic?: "init" | "run" | "status" | "check"): string {
-  if (topic === "init") return "Usage: recovery-loop init [--base <revision>] [--worktree <path>]";
-  if (topic === "run") {
-    return "Usage: recovery-loop run [--max-agent-turns <n>] [--max-checkpoints <n>] [--max-minutes <n>]";
+  if (topic === "init") {
+    return [
+      "Usage: recovery-loop init [--base <revision>] [--worktree <path>]",
+      "",
+      "Create the dedicated autonomous branch, worktree, and runtime state.",
+      "If the tracked contract is missing, write RECOVERY_GOAL.md and",
+      ".recovery-loop/config.json templates and exit without creating a branch.",
+      "",
+      "Options:",
+      "  --base <revision>  Baseline commit (default: current HEAD)",
+      "  --worktree <path>  Persistent worktree outside the operator checkout",
+      "  --help             Show this help",
+      "",
+      "Initialization requires a clean checkout and runs prepare (when configured),",
+      "smoke, and deep commands. A failing baseline is recorded without inventing a",
+      "known-good anchor.",
+    ].join("\n");
   }
-  if (topic === "status") return "Usage: recovery-loop status [--json]";
-  if (topic === "check") return "Usage: recovery-loop check [--deep]";
+  if (topic === "run") {
+    return [
+      "Usage: recovery-loop run [--max-agent-turns <n>] [--max-checkpoints <n>] [--max-minutes <n>]",
+      "",
+      "Start or resume the single-agent recovery loop. Nonempty agent work is",
+      "checkpointed before project checks run; failures enter recovery.",
+      "",
+      "Options:",
+      "  --max-agent-turns <n>  Cap coding-agent turns for this invocation",
+      "  --max-checkpoints <n>  Cap controller-owned checkpoints for this invocation",
+      "  --max-minutes <n>      Cap wall time for this invocation",
+      "  --help                 Show this help",
+      "",
+      "Recovery Loop never pushes, merges into the operator branch, deploys, or",
+      "publishes. The autonomous branch may be temporarily broken between checks and",
+      "recovery.",
+    ].join("\n");
+  }
+  if (topic === "status") {
+    return [
+      "Usage: recovery-loop status [--json]",
+      "",
+      "Read state, Git refs, lock ownership, command health, recovery history,",
+      "budgets, and recent events without taking the controller lock or mutating files.",
+      "",
+      "Options:",
+      "  --json  Emit one stable JSON snapshot instead of human-readable text",
+      "  --help  Show this help",
+    ].join("\n");
+  }
+  if (topic === "check") {
+    return [
+      "Usage: recovery-loop check [--deep]",
+      "",
+      "Run configured commands at the exact autonomous branch head without invoking",
+      "the coding agent. Smoke commands run by default; --deep runs complete smoke",
+      "and deep sets and advances known-good only on a full exact-head pass.",
+      "",
+      "Options:",
+      "  --deep  Run complete smoke and deep command sets",
+      "  --help  Show this help",
+    ].join("\n");
+  }
   return [
     "Usage: recovery-loop <command> [options]",
     "",
+    "A local, recovery-first controller for one coding agent on an isolated branch.",
+    "Checkpoints are provisional recovery points, not approval or correctness claims.",
+    "",
     "Commands:",
-    "  init     Create or resume the dedicated recovery workspace",
+    "  init     Scaffold or create the dedicated recovery workspace",
     "  run      Start or resume autonomous work",
-    "  status   Read current state without mutation",
+    "  status   Inspect current state without mutation",
     "  check    Run configured checks without invoking an agent",
+    "",
+    "Run 'recovery-loop <command> --help' for command details.",
+    "Recovery Loop never pushes, merges, deploys, publishes, or contacts project",
+    "services. Running the coding agent uses the configured model provider.",
   ].join("\n");
 }
 export async function dispatchCli(command: ParsedCommand, handlers: CliHandlers): Promise<void> {
@@ -151,80 +235,11 @@ export async function dispatchCli(command: ParsedCommand, handlers: CliHandlers)
   }
   await handlers[command.command](command as never);
 }
-const unavailable = async (command: string): Promise<void> => {
-  throw new Error(`${command} orchestration is intentionally deferred beyond the Stage 1-4 substrate`);
-};
-export interface StatusSnapshot {
-  sessionId: string;
-  sessionStatus: "running" | "stopped";
-  phase: Phase;
-  branch: string;
-  actualHead: string | null;
-  expectedHead: string;
-  baselineCommit: string;
-  knownGoodCommit: string | null;
-  pendingFailure: PendingFailure | null;
-  lock: LockSnapshot;
-  recentEvents: Array<{ sequence: number; type: string; timestamp: string }>;
-  nextAction: string;
-}
-export async function readStatusSnapshot(repositoryPath: string): Promise<StatusSnapshot> {
-  const repository = await GitRepository.open(repositoryPath);
-  const store = new StateStore(repository.gitCommonDir);
-  const state = await store.readState();
-  if (normalizePath(state.repository.gitCommonDir) !== normalizePath(repository.gitCommonDir)) {
-    throw new Error("state belongs to a different repository");
-  }
-  const events = await store.readEvents();
-  return {
-    sessionId: state.session.id,
-    sessionStatus: state.session.status,
-    phase: state.phase,
-    branch: state.repository.branch,
-    actualHead: await repository.branchHead(state.repository.branch),
-    expectedHead: state.repository.expectedHead,
-    baselineCommit: state.repository.baselineCommit,
-    knownGoodCommit: state.health.knownGoodCommit,
-    pendingFailure: state.health.pendingFailure,
-    lock: await store.peekLock(),
-    recentEvents: events.events.slice(-5).map((event) => ({
-      sequence: event.sequence,
-      type: event.type,
-      timestamp: event.timestamp,
-    })),
-    nextAction: nextAction(state.phase),
-  };
-}
-function nextAction(phase: Phase): string {
-  if (phase === "smoke-checking") return "rerun smoke commands";
-  if (phase === "deep-checking") return "rerun deep commands";
-  if (phase === "checkpointing") return "reconcile checkpoint operation";
-  if (phase === "rolling-back") return "reconcile rollback operation";
-  if (phase === "agent-running") return "preserve interrupted work or resume agent";
-  if (phase === "repairing") return "preserve interrupted repair or resume repair";
-  if (phase === "diagnosing") return "restart diagnosis";
-  if (phase === "stopped") return "remain stopped until run is invoked intentionally";
-  return "continue from idle";
-}
-function normalizePath(value: string): string {
-  const normalized = value.replaceAll("\\", "/").replace(/\/$/u, "");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-function renderStatus(snapshot: StatusSnapshot): string {
-  return [
-    `session: ${snapshot.sessionId} (${snapshot.sessionStatus})`,
-    `phase: ${snapshot.phase}`,
-    `branch: ${snapshot.branch}`,
-    `actual head: ${snapshot.actualHead ?? "missing"}`,
-    `expected head: ${snapshot.expectedHead}`,
-    `baseline: ${snapshot.baselineCommit}`,
-    `known-good: ${snapshot.knownGoodCommit ?? "none"}`,
-    `pending failure: ${snapshot.pendingFailure?.id ?? "none"}`,
-    `next: ${snapshot.nextAction}`,
-  ].join("\n");
-}
+
 const defaultHandlers: CliHandlers = {
-  init: async () => unavailable("init"),
+  init: async (command) => {
+    process.stdout.write(`${renderInitResult(await initializeRepository(process.cwd(), command))}\n`);
+  },
   run: async (command) => {
     const controller = new AbortController();
     const interrupt = (): void => controller.abort(new Error("SIGINT"));
@@ -243,7 +258,7 @@ const defaultHandlers: CliHandlers = {
         },
         signal: controller.signal,
       });
-      process.stdout.write(`recovery-loop stopped: ${String(result.summary.stopReason)}\nsummary: ${result.summaryPath}\n`);
+      process.stdout.write(`${renderRunSummary(result.summary)}\nsummary file: ${result.summaryPath}\n`);
     } finally {
       process.off("SIGINT", interrupt);
       process.off("SIGTERM", terminate);
@@ -255,7 +270,11 @@ const defaultHandlers: CliHandlers = {
       command.json ? `${JSON.stringify(snapshot, null, 2)}\n` : `${renderStatus(snapshot)}\n`,
     );
   },
-  check: async () => unavailable("check"),
+  check: async (command) => {
+    const result = await checkRepository(process.cwd(), command.deep);
+    process.stdout.write(`${renderCheckResult(result)}\n`);
+    if (!result.requestedChecksPassed) throw new CheckCommandFailed();
+  },
 };
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   try {

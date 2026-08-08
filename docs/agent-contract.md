@@ -31,3 +31,11 @@ The agent's statements about tests, correctness, or completion never count as ch
 One persisted thread is resumed until a deterministic rotation boundary is reached: eight turns, hard rollback, an agent-created history violation, the configured repair-attempt limit, an explicit forced rotation, or SDK resume failure. A failed resume starts a fresh thread and reconstructs context from the goal, current Git history, durable state, recent events, health, abandoned ranges, and budgets. Conversation history is an optimization, never a recovery dependency.
 
 Recovery mode adds the exact failing command, normalized result, complete log paths, known-good/current commits, localization evidence, prior repair summaries, and the controller's fallback posture to the same coding role.
+
+## Checkpoints and external correctness
+
+The controller commits safe nonempty work before it runs configured project checks. The autonomous branch may therefore be temporarily broken, and failed work or repair checkpoints may remain visible in history. A checkpoint is a recoverable source state, not an approval or verification claim.
+
+The controller's known-good anchor is command-relative: it names the exact commit at which complete configured smoke and deep sets passed with a clean exact head. It is not an external correctness certification. Final summaries keep the agent's completion belief, final command health, and external evaluation separate; Recovery Loop performs no external product judgment.
+
+Neither the agent nor the controller may automatically push, merge into the operator branch, open a pull request, deploy, publish, release, or contact project services. Those actions remain outside the loop and require a separate operator decision.

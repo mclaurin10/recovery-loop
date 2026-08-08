@@ -10,6 +10,13 @@ import { validateCommandResult, type CommandResult, type CommandSpec,
 import { journaledCheckpoint, reconcileStartup } from "./git-operations.js";
 import type { GitRepository } from "./git-repository.js";
 import { runRecoveryChecks, type HealthControllerOptions } from "./health-controller.js";
+import {
+  ensureLocalizedFailure,
+  localizedFirstBadDiff,
+  stage9Context,
+  type Stage9Hooks,
+} from "./recovery-fallback.js";
+import { beginFallbackRecovery, continueRecoveryAction } from "./recovery-actions.js";
 import { assertCheckpointSafe } from "./safety.js";
 import type { StateStore } from "./state-store.js";
 
@@ -26,6 +33,7 @@ export interface RecoveryControllerOptions {
   signal: AbortSignal; clock: () => Date;
   abortStop: () => "max-wall-time" | "signal" | null;
   afterCheckpointMutation?: () => void | Promise<void>;
+  stage9Hooks?: Stage9Hooks;
 }
 
 export async function recoverPendingFailure(
@@ -51,8 +59,11 @@ export async function recoverPendingFailure(
   if (head !== pending.discoveredAtCommit && pending.lastEvaluatedRepairCommit !== head) {
     return evaluateRepairCommit(context, pending, head);
   }
+  const localization = await ensureLocalizedFailure(stage9Context(context), pending);
+  if (localization.stop !== null) return localization;
+  pending = requireFailure(await context.store.readState(), pending.id);
   if (pending.repairAttempts >= context.config.limits.maxRepairTurnsPerFailure) {
-    return exhaustRepair(context, pending, "forward-repair turn limit reached");
+    return fallbackAfterRepair(context, pending);
   }
   if (state.agent.turns >= context.config.limits.maxAgentTurns) {
     return { stop: "max-agent-turns", detail: pending.id };
@@ -231,7 +242,7 @@ export async function processRecoveryResult(
   }
   const current = (await context.store.readState()).health.pendingFailure;
   if (current !== null && current.repairAttempts >= context.config.limits.maxRepairTurnsPerFailure) {
-    return exhaustRepair(context, current, "forward-repair turn limit reached");
+    return fallbackAfterRepair(context, current);
   }
   return { stop: null, detail: null };
 }
@@ -280,7 +291,7 @@ async function evaluateRepairCommit(
   if (result.classification === "product") {
     const current = requireFailure(await context.store.readState(), failure.id);
     return current.repairAttempts >= context.config.limits.maxRepairTurnsPerFailure
-      ? exhaustRepair(context, current, "failing predicate still fails at the repair limit")
+      ? fallbackAfterRepair(context, current)
       : { stop: null, detail: null };
   }
   return result.classification === "infrastructure"
@@ -418,9 +429,9 @@ async function buildRecoveryEvidence(
     confirmationAttempts: failure.confirmationAttempts,
     firstBadCommit: failure.firstBadCommit,
     regressionWindow: failure.regressionWindow,
-    firstBadDiff: null,
+    firstBadDiff: await localizedFirstBadDiff(stage9Context(context), failure),
     previousRepairSummaries,
-    fallbackAfterTurn: `forward repair only; stop at the Stage 9 boundary after ${context.config.limits.maxRepairTurnsPerFailure} repair turns`,
+    fallbackAfterTurn: `after ${context.config.limits.maxRepairTurnsPerFailure} forward-repair turns, the controller will try a clean unique-commit revert, then verified rescue-ref rollback`,
   };
 }
 
@@ -537,7 +548,22 @@ async function exhaustRepair(
   const head = (await context.store.readState()).repository.expectedHead;
   await rotateAgentThread(context.store, head, "repair-attempt-limit");
   return { stop: "repair-exhausted",
-    detail: `${detail}; pending failure ${failure.id} is preserved for Stage 9` };
+    detail: `${detail}; pending failure ${failure.id} remains durable after bounded recovery` };
+}
+
+async function fallbackAfterRepair(
+  context: RecoveryControllerOptions,
+  failure: PendingFailure,
+): Promise<RecoveryProcessResult> {
+  const head = (await context.store.readState()).repository.expectedHead;
+  await rotateAgentThread(context.store, head, "repair-attempt-limit");
+  return beginFallbackRecovery(stage9Context(context), failure);
+}
+
+export async function resumePendingRecoveryAction(
+  context: RecoveryControllerOptions,
+): Promise<RecoveryProcessResult> {
+  return continueRecoveryAction(stage9Context(context));
 }
 
 function configuredCommand(config: RecoveryConfig, checkId: string): CommandSpec {

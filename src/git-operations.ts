@@ -178,13 +178,16 @@ export async function journaledCleanRevert(
   });
   await store.persistIntent("rolling-back", intent);
   const result = await repository.cleanRevert(options);
-  await options.hooks?.afterGitMutation?.("revert");
-  await store.finishOperation(result?.commit ?? options.expectedHead);
-  await store.appendEvent({
-    type: result === null ? "revert-failed" : "revert-created",
-    headCommit: result?.commit ?? options.expectedHead,
-    data: { targetCommit: options.targetCommit },
+  await store.update((draft) => {
+    if (draft.operation?.id !== intent.id || draft.operation.kind !== "revert") {
+      throw new Error("revert operation changed while recording its Git outcome");
+    }
+    draft.operation.observedHead = result?.commit ?? options.expectedHead;
+    if (result === null) draft.operation.summary = "revert-conflicted";
   });
+  await options.hooks?.afterGitMutation?.("revert");
+  await finishRevert(store, result, intent);
+  await appendRevertEventOnce(store, intent, result?.commit ?? options.expectedHead, result !== null);
   return result;
 }
 export async function journaledHardRollback(
@@ -528,11 +531,21 @@ async function continueRollback(
   if (pending.targetCommit === null || pending.unitId === null) {
     throw new Error("revert operation is missing target or unit ID");
   }
+  if (pending.summary === "revert-conflicted") {
+    const finished = await finishRevert(store, null, pending);
+    await appendRevertEventOnce(store, pending, pending.baseCommit, false);
+    return { action: "revert-conflicted", state: finished, checkpoint: null };
+  }
   if (actual !== pending.baseCommit) {
     const count = await repository.commitCount(`${pending.baseCommit}..${actual}`);
     const message = await repository.commitMessage(actual);
     if (count === 1 && operationTrailerMatches(message, state, pending)) {
-      const finished = await store.finishOperation(actual);
+      const finished = await finishRevert(
+        store,
+        { commit: actual, revertedCommit: pending.targetCommit },
+        pending,
+      );
+      await appendRevertEventOnce(store, pending, actual, true);
       return { action: "revert-finished", state: finished, checkpoint: null };
     }
     throw new CanonicalityError(pending.baseCommit, actual, "unexpected head during revert");
@@ -549,7 +562,8 @@ async function continueRollback(
     unitId: pending.unitId,
   });
   await options.hooks?.afterGitMutation?.("revert");
-  const finished = await store.finishOperation(result?.commit ?? pending.baseCommit);
+  const finished = await finishRevert(store, result, pending);
+  await appendRevertEventOnce(store, pending, result?.commit ?? pending.baseCommit, result !== null);
   return {
     action: result === null ? "revert-conflicted" : "revert-finished",
     state: finished,
@@ -558,6 +572,15 @@ async function continueRollback(
 }
 async function finishRollback(store: StateStore, result: RollbackResult): Promise<void> {
   await store.finishOperation(result.targetCommit, (draft) => {
+    const action = draft.recovery.pendingAction;
+    if (
+      action !== null && action.kind === "reset" && action.oldHead === result.oldHead &&
+      action.targetCommit === result.targetCommit && action.rescueRef === result.rescueRef
+    ) {
+      action.status = "validating";
+      action.resultCommit = result.targetCommit;
+      return;
+    }
     if (!draft.recovery.rescueRefs.includes(result.rescueRef)) {
       draft.recovery.rescueRefs.push(result.rescueRef);
     }
@@ -577,6 +600,39 @@ async function finishRollback(store: StateStore, result: RollbackResult): Promis
     type: "rollback-completed",
     headCommit: result.targetCommit,
     data: { oldHead: result.oldHead, rescueRef: result.rescueRef },
+  });
+}
+async function finishRevert(
+  store: StateStore,
+  result: RevertResult | null,
+  pending: PendingOperation,
+): Promise<RecoveryState> {
+  return store.finishOperation(result?.commit ?? pending.baseCommit, (draft) => {
+    const action = draft.recovery.pendingAction;
+    if (
+      action === null || action.kind !== "revert" || action.oldHead !== pending.baseCommit ||
+      action.targetCommit !== pending.targetCommit
+    ) {
+      return;
+    }
+    action.status = result === null ? "failed" : "validating";
+    action.resultCommit = result?.commit ?? null;
+  });
+}
+async function appendRevertEventOnce(
+  store: StateStore,
+  pending: PendingOperation,
+  headCommit: string,
+  succeeded: boolean,
+): Promise<void> {
+  const type = succeeded ? "revert-created" : "revert-failed";
+  const existing = (await store.readEvents()).events.some((event) =>
+    event.type === type && event.data.operationId === pending.id);
+  if (existing) return;
+  await store.appendEvent({
+    type,
+    headCommit,
+    data: { targetCommit: pending.targetCommit, operationId: pending.id },
   });
 }
 function operation(

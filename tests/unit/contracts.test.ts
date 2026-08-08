@@ -20,8 +20,15 @@ describe("compact contracts", () => {
     };
     delete legacy.agent.pendingResult;
     delete legacy.recovery.lastFailureSignature;
-    expect(validateRecoveryState(legacy).agent.pendingResult).toBeNull();
-    expect(validateRecoveryState(legacy).recovery.lastFailureSignature).toBeNull();
+    delete legacy.recovery.pendingAction;
+    delete legacy.recovery.rollbackSequence;
+    const validatedLegacy = validateRecoveryState(legacy);
+    expect(validatedLegacy.agent.pendingResult).toBeNull();
+    expect(validatedLegacy.recovery).toMatchObject({
+      lastFailureSignature: null,
+      pendingAction: null,
+      rollbackSequence: 0,
+    });
     expect(() => validateRecoveryState({ ...state, schemaVersion: 2 })).toThrow(
       "unsupported schema version",
     );
@@ -46,7 +53,7 @@ describe("compact contracts", () => {
     raw.health.pendingFailure = legacyFailure;
     expect(validateRecoveryState(raw).health.pendingFailure).toMatchObject({
       confirmationAttempts: [], lastRepairCommit: null,
-      lastEvaluatedRepairCommit: null, environmentAttempts: 0,
+      lastEvaluatedRepairCommit: null, environmentAttempts: 0, localization: null,
     });
   });
 

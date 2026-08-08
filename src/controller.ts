@@ -17,8 +17,10 @@ import {
 import {
   processRecoveryResult,
   recoverPendingFailure,
+  resumePendingRecoveryAction,
   type RecoveryControllerOptions,
 } from "./recovery.js";
+import type { Stage9Hooks } from "./recovery-fallback.js";
 import { assertCheckpointSafe, SafetyGuardError } from "./safety.js";
 import { StateStore } from "./state-store.js";
 
@@ -30,7 +32,7 @@ export type RunStopReason =
   | "agent-turn-timeout" | "agent-error" | "guard-rejected" | "repair-exhausted"
   | "recovery-flaky" | "recovery-infrastructure" | "recovery-safety";
 export interface RunLimits { maxAgentTurns?: number; maxCheckpoints?: number; maxMinutes?: number }
-export interface RunControllerHooks {
+export interface RunControllerHooks extends Stage9Hooks {
   afterStartup?: (result: StartupReconcileResult) => void | Promise<void>;
   afterCheckpointMutation?: () => void | Promise<void>;
 }
@@ -114,6 +116,13 @@ async function runLocked(options: RunControllerOptions, store: StateStore): Prom
       }
       const abortStop = stopForAbort(context.signal);
       if (abortStop !== null) return await stopSession(context.operator, store, abortStop, null, clock);
+      if (state.recovery.pendingAction !== null) {
+        const recovered = await resumePendingRecoveryAction(recoveryOptions(context));
+        if (recovered.stop !== null) {
+          return await stopSession(context.operator, store, recovered.stop, recovered.detail, clock);
+        }
+        continue;
+      }
       if (state.health.pendingFailure !== null) {
         const recovered = await recoverPendingFailure(recoveryOptions(context), state.health.pendingFailure);
         if (recovered.stop !== null) {
@@ -212,7 +221,20 @@ async function resumeStartupCheck(result: StartupReconcileResult, options: Healt
   else if (result.action === "rerun-deep") await resumeInterruptedCheckSet(options, "deep");
 }
 function healthOptions(context: LoopContext): HealthControllerOptions {
-  return { store: context.store, repository: context.worktree, config: context.config, now: context.clock().toISOString() };
+  return {
+    store: context.store,
+    repository: context.worktree,
+    config: context.config,
+    now: context.clock().toISOString(),
+    commandSetHooks: {
+      ...(context.hooks?.afterRecoverySmokeCommand === undefined
+        ? {}
+        : { smoke: { afterCommand: context.hooks.afterRecoverySmokeCommand } }),
+      ...(context.hooks?.afterRecoveryDeepCommand === undefined
+        ? {}
+        : { deep: { afterCommand: context.hooks.afterRecoveryDeepCommand } }),
+    },
+  };
 }
 function recoveryOptions(context: LoopContext): RecoveryControllerOptions {
   return {
@@ -228,6 +250,7 @@ function recoveryOptions(context: LoopContext): RecoveryControllerOptions {
     ...(context.hooks?.afterCheckpointMutation === undefined
       ? {}
       : { afterCheckpointMutation: context.hooks.afterCheckpointMutation }),
+    ...(context.hooks === undefined ? {} : { stage9Hooks: context.hooks }),
   };
 }
 async function checkpointGuard(repository: GitRepository, config: RecoveryConfig, expectedBase: string, worktreePath: string): Promise<void> {
@@ -281,10 +304,16 @@ async function stopSession(operator: GitRepository, store: StateStore, reason: R
     recovery: { activeFailureId: state.recovery.activeFailureId, sameSignatureCycles: state.recovery.sameSignatureCycles,
       lastFailureSignature: state.recovery.lastFailureSignature,
       abandonedRanges: state.recovery.abandonedRanges.length, rescueRefs: state.recovery.rescueRefs.length,
+      rollbackSequence: state.recovery.rollbackSequence,
+      pendingAction: state.recovery.pendingAction,
       pendingRepairAttempts: state.health.pendingFailure?.repairAttempts ?? 0,
       pendingRecoveryCycles: state.health.pendingFailure?.recoveryCycles ?? 0,
       pendingConfirmationAttempts: state.health.pendingFailure?.confirmationAttempts.length ?? 0,
       pendingEnvironmentAttempts: state.health.pendingFailure?.environmentAttempts ?? 0 },
+    localizationsStarted: count("localization-started"),
+    regressionsLocalized: count("regression-localized"),
+    localizationsAborted: count("localization-aborted"),
+    abandonedDirections: count("direction-abandoned"),
     pendingFailure: state.health.pendingFailure,
     agentCompletionBelief: events.some((event) => event.type === "agent-completed" && event.data.outcome === "goal_complete"),
     finalHeadReceivedDeepPass: state.health.knownGoodCommit === finalCommit && state.health.lastDeepRunCommit === finalCommit,

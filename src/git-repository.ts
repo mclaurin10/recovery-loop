@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { constants as fsConstants } from "node:fs";
 import type { CheckpointKind } from "./contracts.js";
@@ -304,6 +304,32 @@ export class GitRepository {
     });
     return result.exitCode === 0 ? trimLine(result.stdout) : null;
   }
+  async firstParentChain(ancestor: string, descendant: string): Promise<string[]> {
+    if (!(await this.isAncestor(ancestor, descendant))) {
+      throw new CanonicalityError(ancestor, descendant, "localization anchor is not an ancestor");
+    }
+    const output = (await this.git([
+      "rev-list", "--first-parent", "--reverse", `${ancestor}..${descendant}`,
+    ])).stdout;
+    const commits = output.split(/\r?\n/u).filter((entry) => entry.length > 0);
+    if (commits.at(-1) !== descendant && ancestor !== descendant) {
+      throw new CanonicalityError(ancestor, descendant, "first-parent history did not reach head");
+    }
+    return [ancestor, ...commits];
+  }
+  async hasMergeOnFirstParent(ancestor: string, descendant: string): Promise<boolean> {
+    const output = (await this.git([
+      "rev-list", "--first-parent", "--parents", `${ancestor}..${descendant}`,
+    ])).stdout;
+    return output.split(/\r?\n/u).some((line) => line.trim().split(/\s+/u).length > 2);
+  }
+  async commitDiff(commit: string): Promise<string> {
+    const parent = await this.firstParent(commit);
+    if (parent === null) return (await this.git(["show", "--no-color", "--format=fuller", commit])).stdout;
+    return (await this.git([
+      "diff", "--no-ext-diff", "--no-color", "--find-renames", parent, commit,
+    ])).stdout;
+  }
   async unsafeModeChanges(base = "HEAD"): Promise<UnsafeModeChange[]> {
     const unsafe: UnsafeModeChange[] = [];
     for (const change of await this.changedPaths(true)) {
@@ -564,32 +590,56 @@ export class GitRepository {
     }
     return { oldHead: actual, targetCommit: options.targetCommit, rescueRef: options.rescueRef };
   }
-  async prepareDiagnosticWorktree(worktreePath: string, commit: string): Promise<GitRepository> {
+  async prepareDiagnosticWorktree(
+    worktreePath: string,
+    commit: string,
+    allowedRoot?: string,
+  ): Promise<GitRepository> {
     const target = await this.resolveCommit(commit);
+    const resolvedPath = path.resolve(worktreePath);
+    if (samePath(resolvedPath, this.repositoryRoot)) {
+      throw new Error("diagnostic worktree cannot replace the repository worktree");
+    }
+    if (allowedRoot !== undefined && !isPathWithin(resolvedPath, path.resolve(allowedRoot))) {
+      throw new Error("diagnostic worktree must remain inside its recovery runtime root");
+    }
     let existing: RepositoryIdentity | null = null;
     try {
-      existing = await GitRepository.inspect(worktreePath);
+      existing = await GitRepository.inspect(resolvedPath);
     } catch {
       existing = null;
     }
     if (existing !== null) {
       if (!samePath(existing.gitCommonDir, this.gitCommonDir)) {
-        throw new WorkspaceExistsError(`diagnostic path belongs to another repository: ${worktreePath}`);
+        throw new WorkspaceExistsError(`diagnostic path belongs to another repository: ${resolvedPath}`);
       }
-      const diagnostic = await GitRepository.open(worktreePath);
-      await diagnostic.git(["reset", "--hard", target]);
-      await diagnostic.git(["clean", "-ffd"]);
-      return diagnostic;
+      const diagnostic = await GitRepository.open(resolvedPath);
+      if ((await diagnostic.currentBranch()) === null) {
+        await diagnostic.git(["reset", "--hard", target]);
+        await diagnostic.git(["clean", "-ffdx"]);
+        if ((await diagnostic.head()) !== target) throw new Error("diagnostic worktree did not reach target");
+        return diagnostic;
+      }
     }
     try {
-      await access(worktreePath, fsConstants.F_OK);
-      throw new WorkspaceExistsError(`diagnostic path is not an existing linked worktree: ${worktreePath}`);
+      await access(resolvedPath, fsConstants.F_OK);
+      if (allowedRoot === undefined) {
+        throw new WorkspaceExistsError(
+          `diagnostic path is not an existing detached worktree: ${resolvedPath}`,
+        );
+      }
+      await this.git(["worktree", "remove", "--force", resolvedPath], { allowFailure: true });
+      await rm(resolvedPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     await this.git(["worktree", "prune"]);
-    await this.git(["worktree", "add", "--detach", worktreePath, target]);
-    return GitRepository.open(worktreePath);
+    await this.git(["worktree", "add", "--detach", resolvedPath, target]);
+    const diagnostic = await GitRepository.open(resolvedPath);
+    if ((await diagnostic.currentBranch()) !== null || (await diagnostic.head()) !== target) {
+      throw new Error("diagnostic worktree is not detached at the requested historical commit");
+    }
+    return diagnostic;
   }
 }
 function checkpointMessage(

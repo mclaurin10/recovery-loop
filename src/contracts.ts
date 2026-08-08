@@ -111,6 +111,33 @@ export interface FailureAttempt {
   signature: string;
   resultPath: string;
 }
+export const LOCALIZATION_ROLES = ["anchor", "head", "midpoint"] as const;
+export type LocalizationRole = (typeof LOCALIZATION_ROLES)[number];
+export const LOCALIZATION_VERDICTS = [
+  "pending", "pass", "fail", "flaky", "infrastructure", "safety",
+] as const;
+export type LocalizationVerdict = (typeof LOCALIZATION_VERDICTS)[number];
+export interface LocalizationObservation {
+  role: LocalizationRole;
+  commit: string;
+  verdict: LocalizationVerdict;
+  prepareAttempt: FailureAttempt | null;
+  attempts: FailureAttempt[];
+}
+export const LOCALIZATION_STATUSES = [
+  "running", "localized", "window", "anchor-failed", "aborted",
+] as const;
+export type LocalizationStatus = (typeof LOCALIZATION_STATUSES)[number];
+export interface LocalizationState {
+  headCommit: string;
+  lowerCommit: string;
+  upperCommit: string;
+  status: LocalizationStatus;
+  reason: string | null;
+  nonlinear: boolean;
+  environmentAttempts: number;
+  observations: LocalizationObservation[];
+}
 export const AGENT_OUTCOMES = ["changed", "no_change", "goal_complete", "blocked"] as const;
 export type AgentOutcome = (typeof AGENT_OUTCOMES)[number];
 export interface AgentResponse {
@@ -180,12 +207,31 @@ export interface PendingFailure {
   lastRepairCommit: string | null;
   lastEvaluatedRepairCommit: string | null;
   environmentAttempts: number;
+  localization: LocalizationState | null;
 }
 export interface AbandonedRange {
   oldHead: string;
   targetCommit: string;
   rescueRef: string;
   recordedAt: string;
+}
+export const RECOVERY_ACTION_KINDS = ["revert", "reset"] as const;
+export type RecoveryActionKind = (typeof RECOVERY_ACTION_KINDS)[number];
+export const RECOVERY_ACTION_STATUSES = ["planned", "validating", "failed"] as const;
+export type RecoveryActionStatus = (typeof RECOVERY_ACTION_STATUSES)[number];
+export interface PendingRecoveryAction {
+  failureId: string;
+  kind: RecoveryActionKind;
+  status: RecoveryActionStatus;
+  oldHead: string;
+  targetCommit: string;
+  resultCommit: string | null;
+  rescueRef: string | null;
+  environmentAttempts: number;
+  validationAttempts: number;
+  abandonmentRecorded: boolean;
+  threadRotated: boolean;
+  startedAt: string;
 }
 export interface PendingAgentResult {
   unitId: string; turnId: string; baseCommit: string;
@@ -233,6 +279,8 @@ export interface RecoveryState {
     lastFailureSignature: string | null;
     abandonedRanges: AbandonedRange[];
     rescueRefs: string[];
+    pendingAction: PendingRecoveryAction | null;
+    rollbackSequence: number;
   };
   usage: {
     agentTurns: number;
@@ -262,6 +310,9 @@ export type EventType =
   | "failure-confirmed"
   | "failure-classified"
   | "failure-repaired"
+  | "localization-started"
+  | "regression-localized"
+  | "localization-aborted"
   | "repair-started"
   | "repair-evaluated"
   | "known-good-advanced"
@@ -269,6 +320,7 @@ export type EventType =
   | "revert-created"
   | "revert-failed"
   | "rollback-completed"
+  | "direction-abandoned"
   | "session-stopped";
 export interface RecoveryEvent {
   sequence: number;
@@ -386,6 +438,48 @@ function validateFailureAttempt(value: unknown, path: string): FailureAttempt {
     resultPath: expectNonEmptyString(object.resultPath, `${path}.resultPath`),
   };
 }
+function validateLocalizationObservation(value: unknown, path: string): LocalizationObservation {
+  const object = expectObject(value, path);
+  expectExactKeys(object, path, ["role", "commit", "verdict", "prepareAttempt", "attempts"]);
+  if (!Array.isArray(object.attempts)) {
+    throw new ValidationError(`${path}.attempts`, "expected an array");
+  }
+  return {
+    role: expectEnum(object.role, `${path}.role`, LOCALIZATION_ROLES),
+    commit: expectCommit(object.commit, `${path}.commit`),
+    verdict: expectEnum(object.verdict, `${path}.verdict`, LOCALIZATION_VERDICTS),
+    prepareAttempt: object.prepareAttempt === null
+      ? null
+      : validateFailureAttempt(object.prepareAttempt, `${path}.prepareAttempt`),
+    attempts: object.attempts.map((entry, index) =>
+      validateFailureAttempt(entry, `${path}.attempts[${index}]`)),
+  };
+}
+function validateLocalizationState(value: unknown, path: string): LocalizationState | null {
+  if (value === null) return null;
+  const object = expectObject(value, path);
+  expectExactKeys(object, path, [
+    "headCommit", "lowerCommit", "upperCommit", "status", "reason", "nonlinear",
+    "environmentAttempts", "observations",
+  ]);
+  if (!Array.isArray(object.observations)) {
+    throw new ValidationError(`${path}.observations`, "expected an array");
+  }
+  return {
+    headCommit: expectCommit(object.headCommit, `${path}.headCommit`),
+    lowerCommit: expectCommit(object.lowerCommit, `${path}.lowerCommit`),
+    upperCommit: expectCommit(object.upperCommit, `${path}.upperCommit`),
+    status: expectEnum(object.status, `${path}.status`, LOCALIZATION_STATUSES),
+    reason: expectNullableString(object.reason, `${path}.reason`),
+    nonlinear: expectBoolean(object.nonlinear, `${path}.nonlinear`),
+    environmentAttempts: expectNonNegativeInteger(
+      object.environmentAttempts,
+      `${path}.environmentAttempts`,
+    ),
+    observations: object.observations.map((entry, index) =>
+      validateLocalizationObservation(entry, `${path}.observations[${index}]`)),
+  };
+}
 function validatePendingFailure(value: unknown, path: string): PendingFailure | null {
   if (value === null) return null;
   const object = expectObject(value, path);
@@ -402,7 +496,10 @@ function validatePendingFailure(value: unknown, path: string): PendingFailure | 
     "repairAttempts",
     "recoveryCycles",
     "latestResultPath",
-  ], ["confirmationAttempts", "lastRepairCommit", "lastEvaluatedRepairCommit", "environmentAttempts"]);
+  ], [
+    "confirmationAttempts", "lastRepairCommit", "lastEvaluatedRepairCommit",
+    "environmentAttempts", "localization",
+  ]);
   const failureClasses = ["product", "infrastructure", "flaky", "safety"] as const;
   let regressionWindow: [string, string] | null = null;
   if (object.regressionWindow !== null) {
@@ -442,6 +539,9 @@ function validatePendingFailure(value: unknown, path: string): PendingFailure | 
     environmentAttempts: object.environmentAttempts === undefined
       ? 0
       : expectNonNegativeInteger(object.environmentAttempts, `${path}.environmentAttempts`),
+    localization: object.localization === undefined
+      ? null
+      : validateLocalizationState(object.localization, `${path}.localization`),
   };
 }
 function validateAbandonedRange(value: unknown, path: string): AbandonedRange {
@@ -452,6 +552,40 @@ function validateAbandonedRange(value: unknown, path: string): AbandonedRange {
     targetCommit: expectCommit(object.targetCommit, `${path}.targetCommit`),
     rescueRef: expectNonEmptyString(object.rescueRef, `${path}.rescueRef`),
     recordedAt: expectIsoDate(object.recordedAt, `${path}.recordedAt`),
+  };
+}
+function validatePendingRecoveryAction(value: unknown, path: string): PendingRecoveryAction | null {
+  if (value === null) return null;
+  const object = expectObject(value, path);
+  expectExactKeys(object, path, [
+    "failureId", "kind", "status", "oldHead", "targetCommit", "resultCommit",
+    "rescueRef", "environmentAttempts", "validationAttempts", "abandonmentRecorded",
+    "threadRotated", "startedAt",
+  ]);
+  return {
+    failureId: expectNonEmptyString(object.failureId, `${path}.failureId`),
+    kind: expectEnum(object.kind, `${path}.kind`, RECOVERY_ACTION_KINDS),
+    status: expectEnum(object.status, `${path}.status`, RECOVERY_ACTION_STATUSES),
+    oldHead: expectCommit(object.oldHead, `${path}.oldHead`),
+    targetCommit: expectCommit(object.targetCommit, `${path}.targetCommit`),
+    resultCommit: expectNullableCommit(object.resultCommit, `${path}.resultCommit`),
+    rescueRef: object.rescueRef === null
+      ? null
+      : expectNonEmptyString(object.rescueRef, `${path}.rescueRef`),
+    environmentAttempts: expectNonNegativeInteger(
+      object.environmentAttempts,
+      `${path}.environmentAttempts`,
+    ),
+    validationAttempts: expectNonNegativeInteger(
+      object.validationAttempts,
+      `${path}.validationAttempts`,
+    ),
+    abandonmentRecorded: expectBoolean(
+      object.abandonmentRecorded,
+      `${path}.abandonmentRecorded`,
+    ),
+    threadRotated: expectBoolean(object.threadRotated, `${path}.threadRotated`),
+    startedAt: expectIsoDate(object.startedAt, `${path}.startedAt`),
   };
 }
 function validatePendingAgentResult(value: unknown, path: string): PendingAgentResult | null {
@@ -531,7 +665,7 @@ export function validateRecoveryState(value: unknown): RecoveryState {
     "sameSignatureCycles",
     "abandonedRanges",
     "rescueRefs",
-  ], ["lastFailureSignature"]);
+  ], ["lastFailureSignature", "pendingAction", "rollbackSequence"]);
   const usage = expectObject(state.usage, "state.usage");
   expectExactKeys(usage, "state.usage", [
     "agentTurns",
@@ -631,6 +765,12 @@ export function validateRecoveryState(value: unknown): RecoveryState {
         validateAbandonedRange(entry, `state.recovery.abandonedRanges[${index}]`),
       ),
       rescueRefs: expectStringArray(recovery.rescueRefs, "state.recovery.rescueRefs"),
+      pendingAction: recovery.pendingAction === undefined
+        ? null
+        : validatePendingRecoveryAction(recovery.pendingAction, "state.recovery.pendingAction"),
+      rollbackSequence: recovery.rollbackSequence === undefined
+        ? 0
+        : expectNonNegativeInteger(recovery.rollbackSequence, "state.recovery.rollbackSequence"),
     },
     usage: usageValue,
     eventSequence: expectNonNegativeInteger(state.eventSequence, "state.eventSequence"),
@@ -690,6 +830,8 @@ export function createInitialState(options: InitialStateOptions): RecoveryState 
       lastFailureSignature: null,
       abandonedRanges: [],
       rescueRefs: [],
+      pendingAction: null,
+      rollbackSequence: 0,
     },
     usage: {
       agentTurns: 0,

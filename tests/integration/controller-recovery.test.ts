@@ -120,7 +120,11 @@ describe("Stage 8 confirmed forward repair", () => {
   it("uses fail/pass/fail agreement before repairing the product", async () => {
     const test = await createFixture((config) => {
       const marker = path.join(fixtures.at(-1)!.root, "fail-pass-fail.txt");
-      config.checks.smoke = [sequencedSourceCommand("smoke", marker, ["fail", "pass", "fail", "pass"])];
+      config.checks.smoke = [sequencedSourceCommand(
+        "smoke",
+        marker,
+        ["fail", "pass", "fail", "fail", "fail"],
+      )];
       config.checks.deep = [passCommand("deep")];
     });
     const { result } = await run(test, [
@@ -193,6 +197,7 @@ describe("Stage 8 non-product classifications", () => {
         lastRepairCommit: null,
         lastEvaluatedRepairCommit: null,
         environmentAttempts: 0,
+        localization: null,
       };
       draft.recovery.activeFailureId = "failure-safety";
     });
@@ -341,7 +346,7 @@ describe("Stage 8 repair boundaries", () => {
       repairCheckpoints: 0, pendingFailure: { confirmed: true, repairAttempts: 1 } });
   }, 60_000);
 
-  it("counts no-change and optimistic prose, rotates, and stops at repair exhaustion", async () => {
+  it("counts no-change and optimistic prose, rotates, and cleanly reverts after repair exhaustion", async () => {
     const test = await createFixture((config) => {
       config.checks.smoke = [sourceCommand("smoke", "bad")];
       config.checks.deep = [passCommand("deep")];
@@ -352,13 +357,14 @@ describe("Stage 8 repair boundaries", () => {
         action: ({ workingDirectory }) => writeFile(path.join(workingDirectory, "source.txt"), "bad\n") },
       { method: "resume", response: response("goal_complete", "the failure is fixed and tests pass") },
       { method: "resume", response: response("no_change", "no repair edit found") },
+      { method: "start", response: response("goal_complete", "complete after controller revert") },
     ]);
     const state = await test.store.readState();
-    expect(result.summary).toMatchObject({ stopReason: "repair-exhausted",
-      repairTurns: 2, repairCheckpoints: 0,
-      pendingFailure: { confirmed: true, repairAttempts: 2 } });
-    expect(state.agent.threadId).toBeNull();
-    expect(sdk.calls.slice(1).every((call) => call.prompt?.includes("Recovery evidence"))).toBe(true);
+    expect(result.summary).toMatchObject({ stopReason: "goal-candidate-ready",
+      repairTurns: 2, repairCheckpoints: 0, reverts: 1, pendingFailure: null });
+    expect(state.health.knownGoodCommit).toBe(await test.worktree.head());
+    expect(sdk.calls.slice(1, 3).every((call) => call.prompt?.includes("Recovery evidence"))).toBe(true);
+    expect(sdk.calls[3]?.prompt).toContain("Choose and implement one coherent next improvement");
     expect((await test.store.readEvents()).events.some((event) =>
       event.type === "thread-rotated" && event.data.reason === "repair-attempt-limit")).toBe(true);
   }, 60_000);

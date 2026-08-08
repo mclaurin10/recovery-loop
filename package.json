@@ -21,7 +21,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:acceptance": "vitest run tests/integration tests/unit",
+    "test:acceptance": "vitest run tests/integration tests/unit tests/acceptance",
     "test:agent-live": "vitest run --config vitest.live.config.ts"
   },
   "devDependencies": {

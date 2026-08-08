@@ -352,6 +352,13 @@ async function runDeep(
   await options.store.update((draft) => {
     draft.health.lastDeepRunCommit = commit;
     draft.health.lastDeepRunAt = now;
+    const recoveryAction = draft.recovery.pendingAction;
+    if (
+      completeSet && recoveryAction?.status === "validating" &&
+      recoveryAction.resultCommit === commit
+    ) {
+      recoveryAction.validationAttempts += 1;
+    }
     const fullPass =
       commandsPassed &&
       boundaryFailure === null &&
@@ -542,6 +549,7 @@ function setPendingFailure(
     lastRepairCommit: sameObservation ? existing.lastRepairCommit : null,
     lastEvaluatedRepairCommit: sameObservation ? existing.lastEvaluatedRepairCommit : null,
     environmentAttempts: sameObservation ? existing.environmentAttempts : 0,
+    localization: sameObservation ? existing.localization : null,
   };
   state.health.pendingFailure = pending;
   state.recovery.activeFailureId = pending.id;

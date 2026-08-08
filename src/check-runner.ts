@@ -314,6 +314,7 @@ export async function runJournaledCommandSet(options: {
   repository: GitRepository;
   commands: readonly CommandSpec[];
   commit: string;
+  activeHead?: string;
   category: CommandCategory;
   logRoot: string;
   sequenceStart: number;
@@ -322,17 +323,21 @@ export async function runJournaledCommandSet(options: {
   hooks?: CommandSetHooks;
 }): Promise<CommandResult[]> {
   const state = await options.store.readState();
-  if (state.repository.expectedHead !== options.commit) {
+  const activeHead = options.activeHead ?? options.commit;
+  if (state.repository.expectedHead !== activeHead) {
     throw new Error(
-      `check commit ${options.commit} does not match durable expected head ${state.repository.expectedHead}`,
+      `active head ${activeHead} does not match durable expected head ${state.repository.expectedHead}`,
     );
+  }
+  if (activeHead !== options.commit && options.category !== "diagnostic" && options.category !== "prepare") {
+    throw new Error("only diagnostic or prepare commands may target a historical commit");
   }
   const operationId = `op-${randomUUID()}`;
   const pending: PendingOperation = {
     id: operationId,
     kind: "check",
     unitId: options.category,
-    baseCommit: options.commit,
+    baseCommit: activeHead,
     targetCommit: options.commit,
     observedHead: options.commit,
     rescueRef: null,
@@ -385,7 +390,7 @@ export async function runJournaledCommandSet(options: {
     if ((options.stopOnFailure ?? true) && result.classification !== "pass") break;
   }
   const elapsed = results.reduce((total, result) => total + result.durationMs, 0);
-  await options.store.finishOperation(options.commit, (draft) => {
+  await options.store.finishOperation(activeHead, (draft) => {
     draft.usage.checkMilliseconds += elapsed;
   });
   return results;
